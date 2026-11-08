@@ -2,7 +2,8 @@
 
 A sound module for the PS Vita. It plays SoundFont banks as a sixteen part
 General MIDI module and, with your own ROM images, emulates the Roland MT-32
-through Munt. MIDI comes in over USB from the PSP-MIDI adapter.
+through Munt and the Roland SC-55 Sound Canvas through libEmuSC. MIDI comes
+in over USB from the PSP-MIDI adapter.
 
 ## What it does
 
@@ -20,6 +21,13 @@ through Munt. MIDI comes in over USB from the PSP-MIDI adapter.
   SoundFont engine with its parts; the emulator changes are in
   munt/prism-parallel.patch and every one of them is bit exact, with a
   self check at start-up.
+- SC-55 mode using libEmuSC. Put the control, CPU and wave ROM dumps of an
+  SC-55, SC-55mkII, SC-155 or SCC-1 you own in ux0:data/prism/sc55; the
+  files are told apart by size and content, and firmware builds beyond the
+  common 1.21 and 1.01 are located by scanning for the lookup tables. All
+  sixteen GS parts, variation banks, drum sets, GS SysEx, portamento and
+  aftertouch work; the parts render on all three cores, and voice stealing
+  at the 24 or 28 voice cap (raisable to 64) replaces dropped notes.
 - States. A state is the whole module: the bank, every part, the rack, the
   master, the polyphony and the MT-32 settings. Sixteen user slots, named on
   the device. Launch asks whether to reload the last state.
@@ -52,10 +60,21 @@ MT32_CONTROL.ROM and MT32_PCM.ROM, or the CM-32L pair. Put them in
 ux0:data/prism/mt32. Without them the MT-32 page says NO ROMS LOADED and
 the mode stays off. GM mode needs nothing extra.
 
+## SC-55 ROMs
+
+PRISM does not include the SC-55 ROMs either. To use SC-55 mode you need
+your own dumps from an SC-55, SC-55mkII, SC-155 or SCC-1 you own: the
+control ROM (256 or 512 KB), the CPU ROM (32 KB) and the wave ROMs (whole
+megabytes, three on a mkI, two on a mkII). Put them in ux0:data/prism/sc55
+with any names; the files are told apart by size, and the wave ROMs
+concatenate in name order, so keep names that sort in bank order
+(waverom1.bin, waverom2.bin, waverom3.bin). The mkII's 4 KB sub-CPU dump
+(rom_sm.bin) is not needed and is ignored.
+
 ## Install
 
 Install prism.vpk with VitaShell. The first launch creates ux0:data/prism
-with the soundfonts, mt32 and performances folders.
+with the soundfonts, mt32, sc55 and performances folders.
 
 ## Controls
 
@@ -86,7 +105,7 @@ user shim are shipped as binaries in prism/module.
 
 ## Layout
 
-    prism/          the app: panel, engine, effects, MT-32 wrapper, platform
+    prism/          the app: panel, engine, effects, MT-32 and SC-55 wrappers, platform
     prism/tsf/      TinySoundFont with the local changes (tools/patch_tsf.py)
     prism/fonts/    IBM Plex atlases and their sources; tools/mkfont.py makes them
     prism/sf/       GeneralUser GS
@@ -94,11 +113,13 @@ user shim are shipped as binaries in prism/module.
     prism/credits/  credits and licence texts, installed with the app
     prism/sce_sys/  LiveArea icon, background and gate; tools/mkart.py draws them
     munt/           Munt 2.8.2 library source with the changes, and the patch
+    emusc/          libEmuSC 0.7.0 library source with the changes (see emusc/README.txt)
 
 ## Licences
 
-Munt (libmt32emu) is LGPL 2.1 and is statically linked; this repository
-carries the modified library source and the patch against the upstream
-release so it can be rebuilt and relinked. TinySoundFont is MIT. GeneralUser
-GS is distributed under its own licence in prism/sf/LICENSE.txt. The IBM
-Plex fonts are under the SIL Open Font License in prism/fonts/src/OFL.txt.
+Munt (libmt32emu) and libEmuSC are LGPL 2.1 and are statically linked; this
+repository carries both modified library sources and the patches against
+the upstream releases so they can be rebuilt and relinked. TinySoundFont is
+MIT. GeneralUser GS is distributed under its own licence in
+prism/sf/LICENSE.txt. The IBM Plex fonts are under the SIL Open Font
+License in prism/fonts/src/OFL.txt.

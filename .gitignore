@@ -2,3 +2,6 @@ build/
 *.vpk
 munt/build/
 __pycache__/
+roms/
+midi/
+.vscode/

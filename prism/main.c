@@ -7,6 +7,7 @@
 #include "ui.h"
 #include "perf.h"
 #include "mt32.h"
+#include "sc55.h"
 #include <stdio.h>
 #include <string.h>
 #include "cfg.h"
@@ -116,14 +117,22 @@ int main(int argc, char **argv)
         app_load_bank(PERF_BUILTIN_PATH);
     }
     plat_log("Audio: output thread %s, %d blocks ahead", plat_audio_out_thread_ok() ? "up" : "MISSING (direct output)", plat_audio_ahead());
-    plat_log("MT-32: %d helper cores", plat_par_start(2));
+    plat_log("Emulators: %d helper cores", plat_par_start(2));
     plat_log("MT-32: looking for ROMs");
     ui_boot_frame("Starting");
     if (mt32_open("ux0:data/prism/mt32") == 0) plat_log("MT-32: %s", g_mt32.status);
     else plat_log("MT-32: %s", g_mt32.status);
+    plat_log("SC-55: looking for ROMs");
+    ui_boot_frame("Starting");
+    if (sc55_open("ux0:data/prism/sc55") == 0) plat_log("SC-55: %s", g_sc55.status);
+    else plat_log("SC-55: %s", g_sc55.status);
     if (use_state && perf_wanted_mode() == 1) {   /* the state was saved in MT-32 mode */
         if (mt32_is_open()) syn_event(SEV_MODE, 0, 1, 0);
         else plat_log("State: wanted MT-32 mode, but no ROMs");
+    }
+    if (use_state && perf_wanted_mode() == 2) {   /* the state was saved in SC-55 mode */
+        if (sc55_is_open()) syn_event(SEV_MODE, 0, 2, 0);
+        else plat_log("State: wanted SC-55 mode, but no ROMs");
     }
     ui_init();
     if (use_state) ui_set_perf(state, state_pf.name);
@@ -149,10 +158,11 @@ int main(int argc, char **argv)
         was_conn = st.midi_connected;
         if (lost >= 120) { lost = 1; plat_midi_represent(); }
         st.batt_pct = batt; st.batt_charging = chg;
-        st.voices = g_syn_voices; st.poly = g_syn_poly; st.load = g_syn_load; st.load_avg = g_syn_load_avg;
+        st.voices = g_syn_voices; st.poly = g_syn_mode == 2 ? g_sc55.polycap : g_syn_poly;
+        st.load = g_syn_load; st.load_avg = g_syn_load_avg;
         for (int c = 0; c < 3; c++) st.core_load[c] = g_syn_core_load[c];
-        /* draw every other frame in MT-32 mode to leave core 0 to the helper thread */
-        int draw = !(g_syn_mode == 1 && mt32_is_open() && (frame & 1));
+        /* draw every other frame in emulator modes to leave core 0 to the helper thread */
+        int draw = !(((g_syn_mode == 1 && mt32_is_open()) || (g_syn_mode == 2 && sc55_is_open())) && (frame & 1));
         ui_frame(&st, &pad, draw);
         if (!draw) plat_vblank();
         frame++;

@@ -1,0 +1,1269 @@
+/*  
+ *  This file is part of libEmuSC, a Sound Canvas emulator library
+ *  Copyright (C) 2022-2026  Håkon Skjelten
+ *
+ *  libEmuSC is free software: you can redistribute it and/or modify it
+ *  under the terms of the GNU Lesser General Public License as published
+ *  by the Free Software Foundation, either version 2.1 of the License, or
+ *  (at your option) any later version.
+ *
+ *  libEmuSC is distributed in the hope that it will be useful, but
+ *  WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU Lesser General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with libEmuSC. If not, see <http://www.gnu.org/licenses/>.
+ */
+
+// The SC-55 linueup controls the audio processing with instructions from:
+//  * The internal 32k EPROM on the H8/532 main CPU (CPUROM)
+//  * External 256kB (SC-55) or 512kB (SC-55mkII) EPROM (PROGROM)
+
+// These two ROMs are very tightly connected and extends each other. They must
+// therefore always be of the same ROM set / version.
+
+// This class reads both these ROM files and combines their data for a complete
+// set of control data to modify the audio stored in the PCM ROMs.
+
+// The external EPROM (PROGROM) is encrypted. Decoding is based on the
+// SC55_Soundfont generator written by Kitrinx and NewRisingSun.
+// For more information, see [ https://github.com/Kitrinx/SC55_Soundfont ]
+
+
+#include "control_rom.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <fstream>
+#include <sstream>
+#include <iostream>
+#include <iomanip>
+
+
+namespace EmuSC {
+
+
+const std::vector<uint32_t> ControlRom::_banksSC55 =
+  { 0x10000, 0x1BD00, 0x1DEC0, 0x20000, 0x2BD00, 0x2DEC0, 0x30000, 0x38000 };
+
+// Only a placeholder, SC-88 layout is currently unkown
+const std::vector<uint32_t> ControlRom::_banksSC88 =
+  { 0x10000, 0x1BD00, 0x1DEC0, 0x20000, 0x2BD00, 0x2DEC0, 0x30000, 0x38000 };
+
+ControlRom::ControlRom(std::string romPath, std::string cpuRomPath)
+  : _romPath(romPath)
+{
+  // External EPROM containing control data
+  std::ifstream romFile(romPath, std::ios::binary | std::ios::in);
+  if (!romFile.is_open())
+    throw(std::string("Unable to open control ROM|: ") + romPath);
+
+  if (_identify_model(romFile))
+    throw(std::string("Unknown control ROM file!"));
+
+  // Temporarily block SC-88 ROMs since we don't know how to read them yet
+  if (_model == "SC-88")
+    throw(std::string("SC-88 ROM files are not supported yet!"));
+
+  // Read internal data structures from ROM file
+  _read_instruments(romFile);
+  _read_partials(romFile);
+  _read_samples(romFile);
+  _read_variations(romFile);
+  _read_drum_sets(romFile);
+  _read_lookup_tables_progrom(romFile);
+
+  romFile.close();
+
+  // CPU EPROM
+  romFile.open(cpuRomPath, std::ios::binary | std::ios::in);
+  if (!romFile.is_open())
+    throw(std::string("Unable to open CPU ROM: ") + romPath);
+
+  // Verify size (always 32kB for all SC-55 variants)
+  std::streampos fileSize = romFile.tellg();
+  romFile.seekg(0, std::ios::end);
+  fileSize = romFile.tellg() - fileSize;
+  if (fileSize != 32768)
+    throw(std::string("Invalid CPU ROM (size != 32kB): ") + romPath);
+
+  _read_lookup_tables_cpurom(romFile);
+
+  romFile.close();
+
+  if (0)
+    std::cout << "EmuSC: Found " << _instruments.size() << " instruments, "
+	      << _partials.size() << " parts, "
+	      << _samples.size() << " samples and "
+	      << _drumSets.size() << " drum sets" << std::endl;
+}
+
+
+ControlRom::~ControlRom()
+{}
+
+
+uint16_t ControlRom::_native_endian_uint16(uint8_t *ptr)
+{
+  if (_le_native())
+    return (ptr[0] << 8 | ptr[1]);
+
+  return (ptr[1] << 8 | ptr[0]);
+}
+
+
+uint32_t ControlRom::_native_endian_3bytes_uint32(uint8_t *ptr)
+{
+  uint32_t result = 0;
+  uint8_t *result_ptr = (uint8_t *) &result;
+
+  if (!_le_native()) {
+    for (uint32_t x = 0; x < 3; x++) {
+      result_ptr[x] = ptr[x];
+    }
+  } else {
+    for (int x = 0; x < 3; x++) {
+      result_ptr[x] = ptr[2 - x];
+    }
+  }
+
+  return result;
+}
+
+
+uint32_t ControlRom::_native_endian_4bytes_uint32(uint8_t *ptr)
+{
+  uint32_t result = 0;
+  uint8_t *result_ptr = (uint8_t *) &result;
+
+  if (!_le_native()) {
+    for (uint32_t x = 0; x < 4; x++) {
+      result_ptr[x] = ptr[x];
+    }
+  } else {
+    for (int x = 0; x < 4; x++) {
+      result_ptr[x] = ptr[3 - x];
+    }
+  }
+
+  return result;
+}
+
+
+int ControlRom::_identify_model(std::ifstream &romFile)
+{
+  char data[32];
+
+  // Search for SC-55 control ROM files
+  romFile.seekg(0xf380);
+  romFile.read(data, 29);
+  if (!strncmp(data, "Ver", 3)) {
+    _version.assign(&data[3], 4);
+    _date.assign(&data[24], 5);
+    _model.assign("SC-55");
+    _synthModel = sm_SC55;
+    _synthGeneration = SynthGen::SC55;
+
+    return 0;
+  }
+
+  // Search for SC-55mkII control ROM files
+  romFile.seekg(0x3d148);
+  romFile.read(data, 32);
+  if (!strncmp(&data[0], "GS-28 VER=2.00  SC              ", 32)) {
+    romFile.seekg(0xfff0);
+    romFile.read(data, 10);
+    _version.assign(data, 4);
+    int year = (uint8_t) data[7];
+    int month = (uint8_t) data[8];
+    int day = (uint8_t) data[9];
+    std::stringstream ss;
+    ss << "19" << std::hex << year << "-" << month << "-" << day;
+    _date.assign(ss.str());
+    _model.assign("SC-55mkII");
+    _synthModel = sm_SC55mkII;
+    _synthGeneration = SynthGen::SC55mk2;
+
+    return 0;
+    
+  } else if (!strncmp(&data[0], "GS-28 VER=2.00  LCGS-3 module   ", 32)) {
+    _version.assign("?");
+    _date.assign("?");
+    _model.assign("SCB-55 (SC-55mkII)");
+    _synthModel = sm_SC55mkII;
+    _synthGeneration = SynthGen::SC55mk2;
+
+    return 0;
+  }
+
+  // Search for SCC-1 / SC-155 control ROM files ("VER=x.xx")
+  romFile.seekg(0x3D155);
+  romFile.read(data, 29);
+  if (!strncmp(data, "VER", 3)) {
+    _version.assign(&data[data[3] == '=' ? 4 : 3], 4);
+    _date.assign(&data[24], 5);
+    _model.assign("SCC-1");
+    _synthModel = sm_SCC1;
+    _synthGeneration = SynthGen::SC55;
+  }
+
+  // Search for SC-88 control ROM files
+  romFile.seekg(0x7fc0);
+  romFile.read(data, 24);
+  if (!strncmp(&data[0], "GS-64 VER=3.00  SC-88   ", 24)) {
+    _version.assign("?");
+    _date.assign("?");
+    _model.assign("SC-88");
+    _synthModel = sm_SC88;
+    _synthGeneration = SynthGen::SC88;
+  }
+
+  if (_model.empty())        // No valid ROM file found    TODO: SC88 ??
+    return -1;
+
+  return 0;
+}
+
+
+const std::vector<uint32_t> &ControlRom::_banks(void)
+{
+  switch(_synthModel)
+    {
+    case sm_SC55:
+    case sm_SCC1:
+    case sm_SC55mkII:
+      return _banksSC55;
+
+    case sm_SC88:                       // No work has been done here yet
+      return _banksSC88;
+    }
+
+  throw(std::string("No ROM banks defined for this model"));
+}
+
+
+// Note: instrument partials (instPartial) contains 90 unused bytes! ADSR?
+int ControlRom::_read_instruments(std::ifstream &romFile)
+{
+  // ROM is split in 8 banks
+  const std::vector<uint32_t> &banks = _banks();
+
+  // Instruments are in bank 0 & 3, each instrument block using 216 bytes
+  for (int32_t x = banks[0]; x < banks[4]; x += 216) {
+
+    // Skip area between bank 0 and 3
+    if (x == banks[1])
+      x = banks[3];
+
+    char data[92];
+    romFile.seekg(x);
+    struct Instrument i;
+
+    // First 12 bytes are the instrument name
+    romFile.read(data, 32);
+
+    // Skip empty slots in the ROM file that have no instrument name
+    if (data[0] == '\0')
+      continue;
+
+    i.name.assign(data, 12);
+    i.name.erase(i.name.find_last_not_of(' ') + 1);
+
+    i.volume       = data[12];
+    i.LFO1Waveform = data[14];
+    i.LFO1Rate     = data[15];
+    i.LFO1Delay    = data[16];
+    i.LFO1Fade     = data[17];
+    i.partialsUsed = data[18];
+    i.pitchCurve   = data[19];
+
+    // We have 2 partial parameters sets; starting in bank position 34 & 126
+    for (int p = 0; p < 2; p++) {
+      romFile.seekg(x + 32 + (p * 92));
+      romFile.read(data, 92);
+      i.partials[p].rootKeyOffset = data[1];
+      i.partials[p].partialIndex  = _native_endian_uint16((uint8_t *) data + 2);
+      i.partials[p].LFO2Waveform  = data[4];
+      i.partials[p].LFO2Rate      = data[5];
+      i.partials[p].LFO2Delay     = data[6];
+      i.partials[p].LFO2Fade      = data[7];
+      i.partials[p].TVFFlags      = data[8];
+      i.partials[p].panpot        = data[9];
+      i.partials[p].coarsePitch   = data[10];
+      i.partials[p].finePitch     = data[11];
+      i.partials[p].randPitch     = data[12];
+      i.partials[p].pitchKeyFlw   = data[13];
+      i.partials[p].TVPLFO1Depth  = data[14];
+      i.partials[p].TVPLFO2Depth  = data[15];
+      i.partials[p].pitchEnvDepth = data[16];
+      i.partials[p].pitchEnvL0    = data[18];
+      i.partials[p].pitchEnvL1    = data[19];
+      i.partials[p].pitchEnvL2    = data[20];
+      i.partials[p].pitchEnvL3    = data[21];
+      i.partials[p].pitchEnvL5    = data[22];
+      i.partials[p].pitchEnvT1    = data[23];
+      i.partials[p].pitchEnvT2    = data[24];
+      i.partials[p].pitchEnvT3    = data[25];
+      i.partials[p].pitchEnvT4    = data[26];
+      i.partials[p].pitchEnvT5    = data[27];
+      i.partials[p].pitchETKeyFP14= data[30];
+      i.partials[p].pitchETKeyFP5 = data[31];
+      i.partials[p].pitchETKeyF14 = data[32];
+      i.partials[p].pitchETKeyF5  = data[33];
+      i.partials[p].pitchEnvVSens = data[34];
+      i.partials[p].pitchEnvTVSens= data[35];
+      i.partials[p].TVFCOFVelCur  = data[36];
+      i.partials[p].TVFBaseFlt    = data[37];
+      i.partials[p].TVFResonance  = data[38];
+      i.partials[p].TVFType       = data[39];
+      i.partials[p].TVFCFKeyFlwC  = data[40];
+      i.partials[p].TVFCFKeyFlw   = data[41];
+      i.partials[p].TVFLFO1Depth  = data[42];
+      i.partials[p].TVFLFO2Depth  = data[43];
+      i.partials[p].TVFEnvDepth   = data[44];
+      i.partials[p].TVFEnvL1      = data[45];
+      i.partials[p].TVFEnvL2      = data[46];
+      i.partials[p].TVFEnvL3      = data[47];
+      i.partials[p].TVFEnvL4      = data[48];
+      i.partials[p].TVFEnvL5      = data[49];
+      i.partials[p].TVFEnvT1      = data[50];
+      i.partials[p].TVFEnvT2      = data[51];
+      i.partials[p].TVFEnvT3      = data[52];
+      i.partials[p].TVFEnvT4      = data[53];
+      i.partials[p].TVFEnvT5      = data[54];
+      i.partials[p].TVFETKeyFP14  = data[57];
+      i.partials[p].TVFETKeyFP5   = data[58];
+      i.partials[p].TVFETKeyF14   = data[59];
+      i.partials[p].TVFETKeyF5    = data[60];
+      i.partials[p].TVFCOFVSens   = data[61];
+      i.partials[p].TVFETVSens12  = data[62];
+      i.partials[p].TVFETVSens35  = data[63];
+      i.partials[p].TVALvlVelCur  = data[64];
+      i.partials[p].volume        = data[69];
+      i.partials[p].TVABiasPoint  = data[70];
+      i.partials[p].TVABiasLevel  = data[71];
+      i.partials[p].TVALFO1Depth  = data[72];
+      i.partials[p].TVALFO2Depth  = data[73];
+      i.partials[p].TVAEnvL1      = data[74];
+      i.partials[p].TVAEnvL2      = data[75];
+      i.partials[p].TVAEnvL3      = data[76];
+      i.partials[p].TVAEnvL4      = data[77];
+      i.partials[p].TVAEnvT1      = data[78];
+      i.partials[p].TVAEnvT2      = data[79];
+      i.partials[p].TVAEnvT3      = data[80];
+      i.partials[p].TVAEnvT4      = data[81];
+      i.partials[p].TVAEnvT5      = data[82];
+      i.partials[p].TVAETKeyFP14  = data[85];
+      i.partials[p].TVAETKeyFP5   = data[86];
+      i.partials[p].TVAETKeyF14   = data[87];
+      i.partials[p].TVAETKeyF5    = data[88];
+      i.partials[p].TVAETVSens12  = data[89];
+      i.partials[p].TVAETVSens35  = data[90];
+    }
+
+    _instruments.push_back(i);
+
+    if (0)
+      std::cout << "  -> Instrument " << _instruments.size() << ": " << i.name
+          << " partial0=" << (int) i.partials[0].partialIndex
+          << " partial1=" << (int) i.partials[1].partialIndex
+          << std::endl;
+    }
+
+  return 0;
+}
+
+
+int ControlRom::_read_partials(std::ifstream &romFile)
+{
+  // ROM is split in 8 banks
+  const std::vector<uint32_t> &banks = _banks();
+
+  // Partials are in bank 1 & 4, each partial block using 60 bytes
+  for (int32_t x = banks[1]; x < banks[5]; x += 60) {
+
+    // Skip area between bank 1 and 4
+    if (x == banks[2])
+      x = banks[4];
+
+    char data[32];
+    romFile.seekg(x);
+    struct Partial p;
+
+    // First 12 bytes are the partial name
+    romFile.read(data, 12);
+    p.name.assign(data, 12);
+    p.name.erase(p.name.find_last_not_of(' ') + 1);
+
+    // 16 byte array of break values for tone pitch
+    romFile.read(data, 16);
+    for (int i = 0; i < 16; i++)
+      p.breaks[i] = data[i];
+
+    // 16 2-byte array with accompanying sample IDs
+    romFile.read(data, 32);
+    for (int i = 0; i < 16; i++)
+      p.samples[i] = _native_endian_uint16((uint8_t *) &data[2 * i]);
+
+    // Skip empty slots in the ROM file that has no partial name
+    if (p.name[0]) {
+      _partials.push_back(p);
+
+      if (0)
+	std::cout << "  -> Partial group " << _partials.size() <<  ": "
+		  << p.name << std::endl;
+    }
+  }
+
+  return 0;
+}
+
+
+int ControlRom::_read_variations(std::ifstream &romFile)
+{
+  // ROM is split in 8 banks
+  const std::vector<uint32_t> &banks = _banks();
+
+  // Variations are in bank 6, a table of 128 x 128 2 byte values
+  for (int x = 0; x < 128; x++) {
+    const size_t offset = banks[6] + x * 128 * sizeof(uint16_t);
+    romFile.seekg(offset);
+
+    for (int y = 0; y < 128; y++) {
+      char data[2];
+      romFile.read(data, 2);
+      _variations[x][y] = _native_endian_uint16(reinterpret_cast<uint8_t*>(data));
+    }
+  }
+
+  if (0) {
+    int i = 0;
+    for (auto v : _variations) {
+      std::cout << "  -> Variations " << i++ << ": ";
+      for (int y = 0; y < 128; y++)
+	if (v[y] == 0xffff)
+	  std::cout << "-,";
+	else
+	  std::cout << v[y] << ",";
+      std::cout << '\b' << " " << std::endl;
+    }
+  }
+
+  return 0;
+}
+
+
+int ControlRom::_read_samples(std::ifstream &romFile)
+{
+  // ROM is split in 8 banks
+  const std::vector<uint32_t> &banks = _banks();
+
+  // Samples are in bank 2 & X, each sample block using 16 bytes
+  for (int32_t x = banks[2]; x < banks[6]; x += 16) {
+
+    // Skip area between bank 1 and 4
+    if (x == banks[3])
+      x = banks[5];
+
+    char data[16];
+    romFile.seekg(x);
+    struct Sample s;
+
+    romFile.read(data, 16);
+    s.volume = data[0];
+    s.address = _native_endian_3bytes_uint32((uint8_t *) &data[1]);
+    s.portaOffset = _native_endian_uint16((uint8_t *) &data[4]);
+    s.sampleLen = _native_endian_uint16((uint8_t *) &data[6]);
+    s.loopLen = _native_endian_uint16((uint8_t *) &data[8]);
+    s.loopMode = data[10];
+    s.rootKey = data[11];
+    s.pitchInit = _native_endian_uint16((uint8_t *) &data[12]);
+    s.pitchSust = _native_endian_uint16((uint8_t *) &data[14]);
+
+    // A few samples in the SC-55 ROM carry a loop length beyond the sample
+    // length (Concert Cym. among them). Heal them here, once, so every
+    // consumer sees the same values; healing them lazily per note made the
+    // first note on such a sample differ from the rest.
+    if (s.loopLen > s.sampleLen)
+      s.loopLen = s.sampleLen;
+
+    if (s.sampleLen) {                          // Ignore empty parts
+      _samples.push_back(s);
+      
+      if (0)
+	std::cout << "  -> Sample " << std::setw(3) << _samples.size()
+		  << ": V=" << std::setw(3) << +s.volume
+		  << " AE=" << std::setw(5) << +s.portaOffset
+		  << " SL=" << std::setw(5) << +s.sampleLen
+		  << " LL=" << std::setw(5) << +s.loopLen
+		  << " LM=" << std::setw(3) << +s.loopMode
+		  << " RK=" << std::setw(3) << +s.rootKey
+		  << " PI=" << std::setw(5) << +s.pitchInit - 1024
+		  << " PS=" << std::setw(4) << +s.pitchSust - 1024
+		  << std::endl;
+    }
+  }
+  
+  return 0;
+}           
+
+
+int ControlRom::_read_drum_sets(std::ifstream &romFile)
+{
+  // ROM is split in 8 banks
+  const std::vector<uint32_t> &banks = _banks();
+
+  // The drum sets are defined in bank 7, starting with a 128 byte lookup table
+  int32_t x = banks[7];
+  romFile.seekg(x);
+  romFile.read(reinterpret_cast<char*>(_drumSetsLUT.data()), 128);
+
+  // After the map array there are 14 drum set definitions in 1164 byte blocks 
+  char data[128];
+  for (x = banks[7] + 128; x < 0x03c028; x += 1164) {
+    struct DrumSet d;
+
+    // First array is 16 bit instrument reference
+    for (int i = 0; i < 128; i++) {
+      romFile.read(data, 2);
+      d.preset[i] = _native_endian_uint16((uint8_t *) &data[0]);
+    }
+
+    // Next 7 arrays are 8 bit data
+    romFile.read((char *) d.volume, 128);
+    romFile.read((char *) d.key, 128);
+    romFile.read((char *) d.assignGroup, 128);
+    romFile.read((char *) d.panpot, 128);
+    romFile.read((char *) d.reverb, 128);
+    romFile.read((char *) d.chorus, 128);
+    romFile.read((char *) d.flags, 128);
+
+    // Last 12 bytes are the drum name
+    romFile.read(data, 12);
+    d.name.assign(data, 12);
+    d.name.erase(d.name.find_last_not_of(' ') + 1);
+
+    // Ignore undocumented drum sets and unused memory slots
+    if ((d.name.rfind("AC.", 0) == 0) || data[0] < 0)
+      continue;
+
+    _drumSets.push_back(d);
+
+    if (0)
+      std::cout << "  -> Drum " << _drumSets.size() << ": " << d.name
+		<< std::endl;
+  }
+
+  return _drumSets.size();
+}
+
+
+/* ---- PRISM: lookup-table location --------------------------------------
+ * The LUT offsets above belong to two specific firmware builds (SC-55 1.21
+ * and SC-55mkII 1.01). Other builds carry the same tables at other offsets.
+ * The tables have recognisable shapes, so the known offsets are verified
+ * against the ROM image first; when they do not fit, the image is scanned
+ * for the same layout at a constant shift. A ROM is only rejected when no
+ * placement passes the shape checks. */
+
+static inline int _be16_at(const std::vector<uint8_t> &img, int off)
+{
+  return (img[off] << 8) | img[off + 1];
+}
+
+static bool _fits(const std::vector<uint8_t> &img, int off, int bytes)
+{
+  return off >= 0 && bytes >= 0 && (size_t)(off + bytes) <= img.size();
+}
+
+/* n big-endian 16-bit values, monotone in one direction (equal runs fine) */
+static bool _mono_u16(const std::vector<uint8_t> &img, int off, int n)
+{
+  if (!_fits(img, off, n * 2))
+    return false;
+  bool up = true, down = true;
+  int prev = _be16_at(img, off);
+  for (int i = 1; i < n; i++) {
+    int v = _be16_at(img, off + i * 2);
+    if (v < prev) up = false;
+    if (v > prev) down = false;
+    if (!up && !down) return false;
+    prev = v;
+  }
+  return true;
+}
+
+/* The LFO sine table: a half wave over 128 bytes, 0 up to 255 and back */
+static bool _lfo_sine_shape(const std::vector<uint8_t> &img, int off)
+{
+  if (!_fits(img, off, 130))
+    return false;
+  if (img[off] > 4 || img[off + 64] < 250 || img[off + 128] > 4)
+    return false;
+  for (int i = 0; i < 63; i++)
+    if (img[off + i + 1] < img[off + i]) return false;
+  for (int i = 64; i < 127; i++)
+    if (img[off + i + 1] > img[off + i]) return false;
+  return true;
+}
+
+bool ControlRom::_verify_cpu_lut(const std::vector<uint8_t> &img,
+                                 const struct _CPUMemoryMapLUT &L)
+{
+  // Every table must at least fit in the image
+  const int *o = (const int *) &L;
+  const int sizes[] = { 21*2, 21, 256*2, 128*2, 128*2, 128*2, 128*2, 128*2,
+                        130, 21*2, 11*2, 128*2, 129*2, 256, 128,
+                        11*2, 11*2, 128*2, 64, 128*2, 12, 9, 257*2, 130,
+                        129, 128, 256, 256*2, 47*2 };
+  for (int i = 0; i < (int)(sizeof(sizes) / sizeof(sizes[0])); i++)
+    if (!_fits(img, o[i], sizes[i]))
+      return false;
+
+  if (!_lfo_sine_shape(img, L.LFOSine))
+    return false;
+
+  /* The mkII 1.01 build scores 3 of 4 at its own stock offsets, so 2 is the
+   * floor that still rejects random data decisively. */
+  int score = 0;
+  if (_mono_u16(img, L.EnvelopeTime, 128)) score++;
+  if (_mono_u16(img, L.TVAEnvExpChange, 257)) score++;
+  if (_mono_u16(img, L.LFORate, 128)) score++;
+  if (_mono_u16(img, L.PortamentoRate, 128)) score++;
+
+  return score >= 2;
+}
+
+bool ControlRom::_verify_prog_lut(const std::vector<uint8_t> &img,
+                                  const struct _ProgMemoryMapLUT &L,
+                                  int numVCurves)
+{
+  if (!_fits(img, L.VelocityCurves, 128 * numVCurves) ||
+      !_fits(img, L.KeyMapperIndex, 136 * 2) ||
+      !_fits(img, L.KeyMapper, 128))
+    return false;
+
+  // Velocity curves: non-decreasing ramps over the 128 velocities
+  for (int c = 0; c < 3; c++) {
+    int off = L.VelocityCurves + c * 128, prev = -1;
+    for (int i = 0; i < 128; i++) {
+      int v = img[off + i];
+      if (v < prev) return false;
+      prev = v;
+    }
+    if (img[off + 127] <= img[off + 16])
+      return false;
+  }
+
+  // The key mapper index holds addresses into the KeyMapper table that
+  // follows it, so its first entry equals the KeyMapper offset (minus the
+  // 0x30000 bank base) and every entry stays within reach of it.
+  int first = _be16_at(img, L.KeyMapperIndex);
+  int expect = (L.KeyMapper - 0x30000) & 0xffff;
+  if (first - expect > 0x40 || expect - first > 0x40)
+    return false;
+  for (int i = 1; i < 136; i++) {
+    int v = _be16_at(img, L.KeyMapperIndex + i * 2);
+    if (v < first - 0x40 || v > first + 0x4000)
+      return false;
+  }
+  return true;
+}
+
+/* Shift every offset of a plain-int offset struct */
+template <typename T> static T _shift_lut(const T &base, int delta)
+{
+  T out = base;
+  int *p = (int *) &out;
+  for (size_t i = 0; i < sizeof(T) / sizeof(int); i++)
+    p[i] += delta;
+  return out;
+}
+
+static std::vector<uint8_t> _read_image(std::ifstream &f)
+{
+  f.clear();
+  f.seekg(0, std::ios::end);
+  std::streamoff n = f.tellg();
+  std::vector<uint8_t> img((size_t) n);
+  f.seekg(0);
+  f.read(reinterpret_cast<char *>(img.data()), n);
+  return img;
+}
+
+
+int ControlRom::_read_lookup_tables_progrom(std::ifstream &romFile)
+{
+  int numVCurves = 10;
+  const struct _ProgMemoryMapLUT *PROGmmLUT;
+  bool stockVersion = false;
+  switch(_synthModel)
+    {
+    case SynthModel::sm_SC55:
+    case SynthModel::sm_SCC1:
+      PROGmmLUT = &SC55_1_21_Prog_LUT;
+      numVCurves = 10;
+      stockVersion = _synthModel == sm_SC55 && !_version.compare(0, 4, "1.21");
+      break;
+    case SynthModel::sm_SC55mkII:
+      PROGmmLUT = &SC55mkII_1_01_Prog_LUT;
+      numVCurves = 12;
+      stockVersion = !_version.compare(0, 4, "1.01");
+      break;
+    default:
+      throw(std::string("Unsupported control ROM model (lookup tables)"));
+    }
+
+  std::vector<uint8_t> img = _read_image(romFile);
+  struct _ProgMemoryMapLUT eff = *PROGmmLUT;
+
+  if (_verify_prog_lut(img, eff, numVCurves)) {
+    _lutSrcProg = stockVersion ? LutSource::Stock : LutSource::Verified;
+    _lutDeltaProg = 0;
+  } else {
+    bool found = false;
+    int span = (int) img.size();
+    for (int d = 2; d < span && !found; d += 2) {       // tables are even-aligned
+      for (int s = 0; s < 2 && !found; s++) {
+        int delta = s ? -d : d;
+        if (!_fits(img, PROGmmLUT->VelocityCurves + delta, 128))
+          continue;
+        struct _ProgMemoryMapLUT cand = _shift_lut(*PROGmmLUT, delta);
+        if (_verify_prog_lut(img, cand, numVCurves)) {
+          eff = cand;
+          _lutSrcProg = LutSource::Scanned;
+          _lutDeltaProg = delta;
+          found = true;
+        }
+      }
+    }
+    if (!found)
+      throw(std::string("Unsupported control ROM version (") + _model + " " +
+            _version + "): program lookup tables not found");
+  }
+
+  lookupTables.VelocityCurves.resize(128 * numVCurves);
+  memcpy(lookupTables.VelocityCurves.data(), &img[eff.VelocityCurves],
+         lookupTables.VelocityCurves.size());
+
+  for (int i = 0; i < 136; i++)
+    lookupTables.KeyMapperIndex[i] = _be16_at(img, eff.KeyMapperIndex + i * 2);
+
+  int kmSpan = 0;     // the index holds addresses, not a sorted list
+  for (int i = 0; i < 136; i++) {
+    int d = lookupTables.KeyMapperIndex[i] - lookupTables.KeyMapperIndex.front();
+    if (d > kmSpan) kmSpan = d;
+  }
+  int kmSize = 128 + kmSpan;
+  lookupTables.KeyMapper.resize(kmSize);
+  if (!_fits(img, eff.KeyMapper, kmSize))
+    throw(std::string("Control ROM key mapper out of range"));
+  memcpy(lookupTables.KeyMapper.data(), &img[eff.KeyMapper], kmSize);
+  lookupTables.KeyMapperOffset = eff.KeyMapper - 0x30000;
+
+  return 0;
+}
+
+
+int ControlRom::_read_lookup_tables_cpurom(std::ifstream &romFile)
+{
+  const struct _CPUMemoryMapLUT *CPUmmLUT;
+  bool stockVersion = false;
+  switch(_synthModel)
+    {
+    case SynthModel::sm_SC55:
+    case SynthModel::sm_SCC1:
+      CPUmmLUT = &SC55_1_21_CPU_LUT;
+      stockVersion = _synthModel == sm_SC55 && !_version.compare(0, 4, "1.21");
+      break;
+    case SynthModel::sm_SC55mkII:
+      CPUmmLUT = &SC55mkII_1_01_CPU_LUT;
+      stockVersion = !_version.compare(0, 4, "1.01");
+      break;
+    default:
+      throw(std::string("Unsupported control ROM model (lookup tables)"));
+    }
+
+  struct _CPUMemoryMapLUT eff = *CPUmmLUT;
+  {
+    std::vector<uint8_t> img = _read_image(romFile);
+
+    if (_verify_cpu_lut(img, eff)) {
+      _lutSrcCpu = stockVersion ? LutSource::Stock : LutSource::Verified;
+      _lutDeltaCpu = 0;
+    } else {
+      bool found = false;
+      int span = (int) img.size();
+      for (int d = 2; d < span && !found; d += 2) {
+        for (int s = 0; s < 2 && !found; s++) {
+          int delta = s ? -d : d;
+          int sine = CPUmmLUT->LFOSine + delta;
+          if (!_fits(img, sine, 130) || img[sine] > 4 || img[sine + 64] < 250)
+            continue;                                   // cheap pre-check
+          struct _CPUMemoryMapLUT cand = _shift_lut(*CPUmmLUT, delta);
+          if (_verify_cpu_lut(img, cand)) {
+            eff = cand;
+            _lutSrcCpu = LutSource::Scanned;
+            _lutDeltaCpu = delta;
+            found = true;
+          }
+        }
+      }
+      if (!found)
+        throw(std::string("Unsupported CPU ROM version (") + _model + " " +
+              _version + "): lookup tables not found");
+    }
+  }
+  CPUmmLUT = &eff;      // the verified or shifted offsets
+
+  // 8-bit values
+  romFile.seekg(CPUmmLUT->EnvTimeKeyFollowSens);
+  romFile.read(reinterpret_cast<char*> (&lookupTables.EnvTimeKeyFollowSens),21);
+  romFile.seekg(CPUmmLUT->TVFResonanceFreq);
+  romFile.read(reinterpret_cast<char*> (&lookupTables.TVFResonanceFreq), 256);
+  romFile.seekg(CPUmmLUT->TVFResonance);
+  romFile.read(reinterpret_cast<char*> (&lookupTables.TVFResonance), 128);
+  romFile.seekg(CPUmmLUT->TVFEnvScale);
+  romFile.read(reinterpret_cast<char*> (&lookupTables.TVFEnvScale), 64);
+  romFile.seekg(CPUmmLUT->LFOSine);
+  romFile.read(reinterpret_cast<char*> (&lookupTables.LFOSine), 130);
+  romFile.seekg(CPUmmLUT->TVABiasLevel);
+  romFile.read(reinterpret_cast<char*> (&lookupTables.TVABiasLevel), 130);
+  romFile.seekg(CPUmmLUT->TVAPanpot);
+  romFile.read(reinterpret_cast<char*> (&lookupTables.TVAPanpot), 129);
+  romFile.seekg(CPUmmLUT->TVALevelIndex);
+  romFile.read(reinterpret_cast<char*> (&lookupTables.TVALevelIndex), 128);
+  romFile.seekg(CPUmmLUT->TVALevel);
+  romFile.read(reinterpret_cast<char*> (&lookupTables.TVALevel), 256);
+  romFile.seekg(CPUmmLUT->EnvSegmentStep);
+  romFile.read(reinterpret_cast<char*> (&lookupTables.EnvSegmentStep), 12);
+  romFile.seekg(CPUmmLUT->EnvSegmentCurve);
+  romFile.read(reinterpret_cast<char*> (&lookupTables.EnvSegmentCurve), 9);
+
+  // 16-bit values
+  _read_lut_16bit(romFile, CPUmmLUT->PitchParamScale, lookupTables.PitchParamScale);
+  _read_lut_16bit(romFile, CPUmmLUT->EnvTimeScale, lookupTables.EnvTimeScale);
+  _read_lut_16bit(romFile, CPUmmLUT->PortamentoRate, lookupTables.PortamentoRate);
+  _read_lut_16bit(romFile, CPUmmLUT->TVFEnvDepth, lookupTables.TVFEnvDepth);
+  _read_lut_16bit(romFile, CPUmmLUT->TVFCutoffFreq, lookupTables.TVFCutoffFreq);
+  _read_lut_16bit(romFile, CPUmmLUT->EnvelopeTime, lookupTables.envelopeTime);
+  _read_lut_16bit(romFile, CPUmmLUT->LFORate, lookupTables.LFORate);
+  _read_lut_16bit(romFile, CPUmmLUT->LFODelayTime, lookupTables.LFODelayTime);
+  _read_lut_16bit(romFile, CPUmmLUT->LFOTVFDepth, lookupTables.LFOTVFDepth);
+  _read_lut_16bit(romFile, CPUmmLUT->LFOTVPDepth, lookupTables.LFOTVPDepth);
+  _read_lut_16bit(romFile, CPUmmLUT->PitchEnvVelSens1, lookupTables.PitchEnvVelSens1);
+  _read_lut_16bit(romFile, CPUmmLUT->PitchEnvVelSens2, lookupTables.PitchEnvVelSens2);
+  _read_lut_16bit(romFile, CPUmmLUT->PitchEnvDepth, lookupTables.PitchEnvDepth);
+  _read_lut_16bit(romFile, CPUmmLUT->TVAEnvExpChange, lookupTables.TVAEnvExpChange);
+  _read_lut_16bit(romFile, CPUmmLUT->TVFCutoffVSens, lookupTables.TVFCutoffVSens);
+  _read_lut_16bit(romFile, CPUmmLUT->TVFCutoffFreqKF, lookupTables.TVFCutoffFreqKF);
+  _read_lut_16bit(romFile, CPUmmLUT->PitchFineExp, lookupTables.PitchFineExp);
+  _read_lut_16bit(romFile, CPUmmLUT->PitchCoarseExp, lookupTables.PitchCoarseExp);
+
+  return 0;
+}
+
+
+int ControlRom::_read_lut_16bit(std::ifstream &ifs, int pos,
+                                std::array<int, 11> &lut)
+{
+  ifs.seekg(pos);
+
+  for (int i = 0; i < 11; i ++) {
+    uint16_t value;
+    if (!ifs.read(reinterpret_cast<char*>(&value), sizeof(value))) {
+      std::cerr << "libEmuSC: Error reading LUT from ROM" << std::endl;
+      return i;
+    }
+
+    lut[i] = static_cast<int>(_native_endian_uint16((uint8_t *) &value));
+  }
+
+  return 11;
+}
+
+
+int ControlRom::_read_lut_16bit(std::ifstream &ifs, int pos,
+                                std::array<int, 21> &lut)
+{
+  ifs.seekg(pos);
+
+  for (int i = 0; i < 21; i ++) {
+    uint16_t value;
+    if (!ifs.read(reinterpret_cast<char*>(&value), sizeof(value))) {
+      std::cerr << "libEmuSC: Error reading LUT from ROM" << std::endl;
+      return i;
+    }
+
+    lut[i] = static_cast<int>(_native_endian_uint16((uint8_t *) &value));
+  }
+
+  return 21;
+}
+
+
+int ControlRom::_read_lut_16bit(std::ifstream &ifs, int pos,
+                                std::array<int, 47> &lut)
+{
+  ifs.seekg(pos);
+
+  for (int i = 0; i < 47; i ++) {
+    uint16_t value;
+    if (!ifs.read(reinterpret_cast<char*>(&value), sizeof(value))) {
+      std::cerr << "libEmuSC: Error reading LUT from ROM" << std::endl;
+      return i;
+    }
+
+    lut[i] = static_cast<int>(_native_endian_uint16((uint8_t *) &value));
+  }
+
+  return 47;
+}
+
+
+int ControlRom::_read_lut_16bit(std::ifstream &ifs, int pos,
+                                std::array<int, 128> &lut)
+{
+  ifs.seekg(pos);
+
+  for (int i = 0; i < 128; i ++) {
+    uint16_t value;
+    if (!ifs.read(reinterpret_cast<char*>(&value), sizeof(value))) {
+      std::cerr << "libEmuSC: Error reading LUT from ROM" << std::endl;
+      return i;
+    }
+
+    lut[i] = static_cast<int>(_native_endian_uint16((uint8_t *) &value));
+  }
+
+  return 128;
+}
+
+
+int ControlRom::_read_lut_16bit(std::ifstream &ifs, int pos,
+                                std::array<int, 129> &lut)
+{
+  ifs.seekg(pos);
+
+  for (int i = 0; i < 129; i ++) {
+    uint16_t value;
+    if (!ifs.read(reinterpret_cast<char*>(&value), sizeof(value))) {
+      std::cerr << "libEmuSC: Error reading LUT from ROM" << std::endl;
+      return i;
+    }
+
+    lut[i] = static_cast<int>(_native_endian_uint16((uint8_t *) &value));
+  }
+
+  return 129;
+}
+
+
+int ControlRom::_read_lut_16bit(std::ifstream &ifs, int pos,
+                                std::array<int, 130> &lut)
+{
+  ifs.seekg(pos);
+
+  for (int i = 0; i < 130; i ++) {
+    uint16_t value;
+    if (!ifs.read(reinterpret_cast<char*>(&value), sizeof(value))) {
+      std::cerr << "libEmuSC: Error reading LUT from ROM" << std::endl;
+      return i;
+    }
+
+    lut[i] = static_cast<int>(_native_endian_uint16((uint8_t *) &value));
+  }
+
+  return 130;
+}
+
+
+int ControlRom::_read_lut_16bit(std::ifstream &ifs, int pos,
+                                std::array<int, 136> &lut)
+{
+  ifs.seekg(pos);
+
+  for (int i = 0; i < 136; i ++) {
+    uint16_t value;
+    if (!ifs.read(reinterpret_cast<char*>(&value), sizeof(value))) {
+      std::cerr << "libEmuSC: Error reading LUT from ROM" << std::endl;
+      return i;
+    }
+
+    lut[i] = static_cast<int>(_native_endian_uint16((uint8_t *) &value));
+  }
+
+  return 136;
+}
+
+
+int ControlRom::_read_lut_16bit(std::ifstream &ifs, int pos,
+                                std::array<int, 256> &lut)
+{
+  ifs.seekg(pos);
+
+  for (int i = 0; i < 256; i ++) {
+    uint16_t value;
+    if (!ifs.read(reinterpret_cast<char*>(&value), sizeof(value))) {
+      std::cerr << "libEmuSC: Error reading LUT from ROM" << std::endl;
+      return i;
+    }
+
+    lut[i] = static_cast<int>(_native_endian_uint16((uint8_t *) &value));
+  }
+
+  return 256;
+}
+
+
+int ControlRom::_read_lut_16bit(std::ifstream &ifs, int pos,
+                                std::array<int, 257> &lut)
+{
+  ifs.seekg(pos);
+
+  for (int i = 0; i < 257; i ++) {
+    uint16_t value;
+    if (!ifs.read(reinterpret_cast<char*>(&value), sizeof(value))) {
+      std::cerr << "libEmuSC: Error reading LUT from ROM" << std::endl;
+      return i;
+    }
+
+    lut[i] = static_cast<int>(_native_endian_uint16((uint8_t *) &value));
+  }
+
+  return 257;
+}
+
+
+const uint8_t ControlRom::max_polyphony(void)
+{
+  switch (_synthModel)
+    {
+    case sm_SC55:
+    case sm_SCC1:
+      return _maxPolyphonySC55;
+
+    case sm_SC55mkII:
+      return _maxPolyphonySC55mkII;
+
+    case sm_SC88:
+    case sm_SC88Pro:
+      return _maxPolyphonySC88;
+    }
+
+  throw(std::string("No maximum polyphony defined for this model"));
+}
+
+
+int ControlRom::dump_demo_songs(std::string path)
+{
+  int index = 1;
+  std::cout << "EmuSC: Searching for MIDI songs in control ROM..." << std::endl;
+
+  std::ifstream romFile(_romPath, std::ios::binary | std::ios::in);
+  if (!romFile.is_open()) {
+    std::cerr << "Unable to open control ROM: " << _romPath << std::endl;
+    return -1;
+  }
+
+  // MIDI files are placed at different places in the ROM depending on model
+  int romIndex;
+  int romSize;
+  if (_synthModel == sm_SC55) {
+    romIndex = 0;
+    romSize = _banks()[0];
+  } else if (_synthModel == sm_SC55mkII) {
+    romIndex = 0x03fff0;
+    romFile.seekg(0, std::ios::end);
+    romSize = romFile.tellg();
+  } else {          // Unkown structures for SC-88, just read entire ROM
+    romIndex = 0;
+    romFile.seekg(0, std::ios::end);
+    romSize = romFile.tellg();
+  }
+
+  std::vector<uint8_t> romData(romSize - romIndex);
+  romFile.seekg(romIndex);
+  romFile.read((char*) &romData[0], romSize);
+  romFile.close();
+
+  for (uint32_t i = 0; i < romData.size() - 6; i++) {
+    if (romData[i + 0] == 0x4d &&
+	romData[i + 1] == 0x54 &&
+	romData[i + 2] == 0x68 &&
+	romData[i + 3] == 0x64 &&
+	romData[i + 4] == 0x00 &&
+	romData[i + 5] == 0x00 &&
+	romData[i + 6] == 0x00 &&
+	romData[i + 7] == 0x06) {
+
+      uint16_t numTracks = _native_endian_uint16(&romData[i+10]);
+      uint32_t fileSize = 14;
+      for (int n = 0; n < numTracks; n++) {
+	if (romData[i + fileSize] == 0x4d &&
+	    romData[i + fileSize + 1] == 0x54 &&
+	    romData[i + fileSize + 2] == 0x72 &&
+	    romData[i + fileSize + 3] == 0x6b) {
+	  fileSize += _native_endian_4bytes_uint32(&romData[i + fileSize + 4]);
+	  fileSize += 8;                                    // Add track header
+	} else {
+	  return -1;
+	}
+      }
+
+      if (path.back() != '/')
+	path.append("/");
+
+      std::string fileName = "sc_song_" + std::to_string(index++) + ".mid";
+
+      std::ofstream midiFile(path + fileName, std::ios::out | std::ios::binary);
+      midiFile.write((char*) &romData[i], fileSize);
+      if (midiFile.good())
+	std::cout << " -> Found demo song at 0x" << std::hex << romIndex + i
+		  << " (" << std::dec << (int) fileSize << " bytes)"
+		  << std::endl
+		  << "  -> File written to " << path + fileName << std::endl;
+      else
+	std::cout << " -> Error writing demo song to disk: " << path
+		  << " Check write permissions and available space."
+		  << std::endl;
+      midiFile.close();
+    }
+  }
+
+  if (index == 1)
+    std::cout << "EmuSC: Control ROM contained no MIDI files " << std::endl;
+
+  return index - 1;
+}
+
+
+std::vector<std::vector<std::string>> ControlRom::get_instruments_list(void)
+{
+  std::vector<std::vector<std::string>> instListVector;
+
+  // First row is header
+  std::vector<std::string> headerVector;
+  headerVector.push_back("Name");
+  headerVector.push_back("Partial 0");
+  headerVector.push_back("Partial 1");
+  instListVector.push_back(headerVector);
+
+  for (struct Instrument inst: _instruments) {
+    std::vector<std::string> instVector;
+    instVector.push_back(inst.name);
+    instVector.push_back(std::to_string(inst.partials[0].partialIndex));
+    instVector.push_back(std::to_string(inst.partials[1].partialIndex));
+    instListVector.push_back(instVector);
+  }
+
+  return instListVector;
+}
+
+
+std::vector<std::vector<std::string>> ControlRom::get_partials_list(void)
+{
+  std::vector<std::vector<std::string>> partListVector;
+
+  // First row is header
+  std::vector<std::string> headerVector;
+  headerVector.push_back("Name");
+  for (int i = 0; i < 16; i++)
+    headerVector.push_back("Break " + std::to_string(i));
+  for (int i = 0; i < 16; i++)
+    headerVector.push_back("Sample " + std::to_string(i));
+  partListVector.push_back(headerVector);
+
+  for (struct Partial partial: _partials) {
+    std::vector<std::string> partVector;
+    partVector.push_back(partial.name);
+    for (int i = 0; i < 16; i++)
+      partVector.push_back(std::to_string(partial.breaks[i]));
+    for (int i = 0; i < 16; i++)
+      partVector.push_back(std::to_string(partial.samples[i]));
+    partListVector.push_back(partVector);
+  }
+
+  return partListVector;
+}
+
+
+std::vector<std::vector<std::string>> ControlRom::get_samples_list(void)
+{
+  std::vector<std::vector<std::string>> samplesListVector;
+
+  // First row is header
+  std::vector<std::string> headerVector;
+  headerVector.push_back("Volume");
+  headerVector.push_back("Attack Start");
+  headerVector.push_back("Sample Length");
+  headerVector.push_back("Loop Length");
+  headerVector.push_back("Loop Mode");
+  headerVector.push_back("Root Key");
+  headerVector.push_back("Initial Pitch");
+  headerVector.push_back("Sustained Pitch");
+  samplesListVector.push_back(headerVector);
+  
+  for (struct Sample sample: _samples) {
+    std::vector<std::string> sampleVector;
+    sampleVector.push_back(std::to_string(sample.volume));
+    sampleVector.push_back(std::to_string(sample.portaOffset));
+    sampleVector.push_back(std::to_string(sample.sampleLen));
+    sampleVector.push_back(std::to_string(sample.loopLen));
+    sampleVector.push_back(std::to_string(sample.loopMode));
+    sampleVector.push_back(std::to_string(sample.rootKey));
+    sampleVector.push_back(std::to_string(sample.pitchInit));
+    sampleVector.push_back(std::to_string(sample.pitchSust));
+
+    samplesListVector.push_back(sampleVector);
+  }
+
+  return samplesListVector;
+}
+
+
+bool ControlRom::intro_anim_available(void)
+{
+  // TODO: Use SHA256 and proper ROM list to identify ROMs with intro animations
+  if (_synthModel == sm_SC55mkII)
+    return true;
+
+  return false;
+}
+
+
+std::vector<uint8_t> ControlRom::get_intro_anim(int animIndex)
+{
+  int romIndex;
+  int length;
+
+  if (_synthModel == sm_SC55mkII) {
+    if (animIndex == 0)
+      romIndex = 0x70000;               // SC-55mkII
+    else if (animIndex == 1)
+      romIndex = 0x71280;               // SC-155mkII
+    else
+      return std::vector<uint8_t> {};
+
+    length = 0x1280;
+
+  } else {
+    return std::vector<uint8_t> {};
+  }
+
+  std::ifstream romFile(_romPath, std::ios::binary | std::ios::in);
+  if (!romFile.is_open()) {
+    std::cerr << "Unable to open control ROM: " << _romPath << std::endl;
+  }
+
+  std::vector<uint8_t> romData(length);
+  romFile.seekg(romIndex);
+  romFile.read((char*) &romData[0], length);
+  romFile.close();
+
+  return romData;
+}
+
+}

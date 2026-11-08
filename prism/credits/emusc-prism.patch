@@ -1,0 +1,1754 @@
+diff -ruN /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/CMakeLists.txt emusc/libemusc/src/CMakeLists.txt
+--- /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/CMakeLists.txt	2026-11-07 19:34:19.163782400 -0800
++++ emusc/libemusc/src/CMakeLists.txt	1969-12-31 16:00:00.000000000 -0800
+@@ -1,47 +0,0 @@
+-cmake_minimum_required(VERSION 3.8...3.30)
+-
+-configure_file(config.h.in config.h)
+-
+-add_library(emusc
+-  chorus.cc
+-  chorus.h
+-  control_rom.cc
+-  control_rom.h
+-  envelope.cc
+-  envelope.h
+-  note.cc
+-  note.h
+-  params.h
+-  part.cc
+-  part.h
+-  partial.cc
+-  partial.h
+-  pitch.cc
+-  pitch.h
+-  resampler.cc
+-  resampler.h
+-  reverb.cc
+-  reverb.h
+-  settings.cc
+-  settings.h
+-  slew_calc.h
+-  svf.cc
+-  svf.h
+-  synth.cc
+-  synth.h
+-  system_effects.cc
+-  system_effects.h
+-  tva.cc
+-  tva.h
+-  tvf.cc
+-  tvf.h
+-  wave_generator.cc
+-  wave_generator.h
+-  wave_oscillator.cc
+-  wave_oscillator.h
+-  wave_rom.cc
+-  wave_rom.h)
+-
+-target_compile_features(emusc PUBLIC cxx_std_17)
+-target_include_directories(emusc PUBLIC "${CMAKE_CURRENT_BINARY_DIR}")
+-set_target_properties(emusc PROPERTIES CXX_EXTENSIONS OFF VERSION ${CMAKE_PROJECT_VERSION} SOVERSION ${CMAKE_PROJECT_VERSION_MAJOR})
+diff -ruN /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/config.h emusc/libemusc/src/config.h
+--- /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/config.h	1969-12-31 16:00:00.000000000 -0800
++++ emusc/libemusc/src/config.h	2026-11-07 19:43:48.177661600 -0800
+@@ -0,0 +1,4 @@
++/* Static stand-in for the CMake-generated config.h (PRISM build). */
++#ifndef VERSION
++#define VERSION "0.7.0-prism"
++#endif
+diff -ruN /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/config.h.in emusc/libemusc/src/config.h.in
+--- /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/config.h.in	2026-11-07 19:34:19.189877000 -0800
++++ emusc/libemusc/src/config.h.in	1969-12-31 16:00:00.000000000 -0800
+@@ -1 +0,0 @@
+-#define VERSION "@libemusc_VERSION@"
+diff -ruN /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/control_rom.cc emusc/libemusc/src/control_rom.cc
+--- /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/control_rom.cc	2026-11-07 19:34:19.197474700 -0800
++++ emusc/libemusc/src/control_rom.cc	2026-11-07 20:21:06.315946300 -0800
+@@ -198,11 +198,11 @@
+     return 0;
+   }
+ 
+-  // Search for SCC-1 control ROM files
++  // Search for SCC-1 / SC-155 control ROM files ("VER=x.xx")
+   romFile.seekg(0x3D155);
+   romFile.read(data, 29);
+   if (!strncmp(data, "VER", 3)) {
+-    _version.assign(&data[3], 4);
++    _version.assign(&data[data[3] == '=' ? 4 : 3], 4);
+     _date.assign(&data[24], 5);
+     _model.assign("SCC-1");
+     _synthModel = sm_SCC1;
+@@ -481,7 +481,14 @@
+     s.rootKey = data[11];
+     s.pitchInit = _native_endian_uint16((uint8_t *) &data[12]);
+     s.pitchSust = _native_endian_uint16((uint8_t *) &data[14]);
+-    
++
++    // A few samples in the SC-55 ROM carry a loop length beyond the sample
++    // length (Concert Cym. among them). Heal them here, once, so every
++    // consumer sees the same values; healing them lazily per note made the
++    // first note on such a sample differ from the rest.
++    if (s.loopLen > s.sampleLen)
++      s.loopLen = s.sampleLen;
++
+     if (s.sampleLen) {                          // Ignore empty parts
+       _samples.push_back(s);
+       
+@@ -553,40 +560,208 @@
+ }
+ 
+ 
++/* ---- PRISM: lookup-table location --------------------------------------
++ * The LUT offsets above belong to two specific firmware builds (SC-55 1.21
++ * and SC-55mkII 1.01). Other builds carry the same tables at other offsets.
++ * The tables have recognisable shapes, so the known offsets are verified
++ * against the ROM image first; when they do not fit, the image is scanned
++ * for the same layout at a constant shift. A ROM is only rejected when no
++ * placement passes the shape checks. */
++
++static inline int _be16_at(const std::vector<uint8_t> &img, int off)
++{
++  return (img[off] << 8) | img[off + 1];
++}
++
++static bool _fits(const std::vector<uint8_t> &img, int off, int bytes)
++{
++  return off >= 0 && bytes >= 0 && (size_t)(off + bytes) <= img.size();
++}
++
++/* n big-endian 16-bit values, monotone in one direction (equal runs fine) */
++static bool _mono_u16(const std::vector<uint8_t> &img, int off, int n)
++{
++  if (!_fits(img, off, n * 2))
++    return false;
++  bool up = true, down = true;
++  int prev = _be16_at(img, off);
++  for (int i = 1; i < n; i++) {
++    int v = _be16_at(img, off + i * 2);
++    if (v < prev) up = false;
++    if (v > prev) down = false;
++    if (!up && !down) return false;
++    prev = v;
++  }
++  return true;
++}
++
++/* The LFO sine table: a half wave over 128 bytes, 0 up to 255 and back */
++static bool _lfo_sine_shape(const std::vector<uint8_t> &img, int off)
++{
++  if (!_fits(img, off, 130))
++    return false;
++  if (img[off] > 4 || img[off + 64] < 250 || img[off + 128] > 4)
++    return false;
++  for (int i = 0; i < 63; i++)
++    if (img[off + i + 1] < img[off + i]) return false;
++  for (int i = 64; i < 127; i++)
++    if (img[off + i + 1] > img[off + i]) return false;
++  return true;
++}
++
++bool ControlRom::_verify_cpu_lut(const std::vector<uint8_t> &img,
++                                 const struct _CPUMemoryMapLUT &L)
++{
++  // Every table must at least fit in the image
++  const int *o = (const int *) &L;
++  const int sizes[] = { 21*2, 21, 256*2, 128*2, 128*2, 128*2, 128*2, 128*2,
++                        130, 21*2, 11*2, 128*2, 129*2, 256, 128,
++                        11*2, 11*2, 128*2, 64, 128*2, 12, 9, 257*2, 130,
++                        129, 128, 256, 256*2, 47*2 };
++  for (int i = 0; i < (int)(sizeof(sizes) / sizeof(sizes[0])); i++)
++    if (!_fits(img, o[i], sizes[i]))
++      return false;
++
++  if (!_lfo_sine_shape(img, L.LFOSine))
++    return false;
++
++  /* The mkII 1.01 build scores 3 of 4 at its own stock offsets, so 2 is the
++   * floor that still rejects random data decisively. */
++  int score = 0;
++  if (_mono_u16(img, L.EnvelopeTime, 128)) score++;
++  if (_mono_u16(img, L.TVAEnvExpChange, 257)) score++;
++  if (_mono_u16(img, L.LFORate, 128)) score++;
++  if (_mono_u16(img, L.PortamentoRate, 128)) score++;
++
++  return score >= 2;
++}
++
++bool ControlRom::_verify_prog_lut(const std::vector<uint8_t> &img,
++                                  const struct _ProgMemoryMapLUT &L,
++                                  int numVCurves)
++{
++  if (!_fits(img, L.VelocityCurves, 128 * numVCurves) ||
++      !_fits(img, L.KeyMapperIndex, 136 * 2) ||
++      !_fits(img, L.KeyMapper, 128))
++    return false;
++
++  // Velocity curves: non-decreasing ramps over the 128 velocities
++  for (int c = 0; c < 3; c++) {
++    int off = L.VelocityCurves + c * 128, prev = -1;
++    for (int i = 0; i < 128; i++) {
++      int v = img[off + i];
++      if (v < prev) return false;
++      prev = v;
++    }
++    if (img[off + 127] <= img[off + 16])
++      return false;
++  }
++
++  // The key mapper index holds addresses into the KeyMapper table that
++  // follows it, so its first entry equals the KeyMapper offset (minus the
++  // 0x30000 bank base) and every entry stays within reach of it.
++  int first = _be16_at(img, L.KeyMapperIndex);
++  int expect = (L.KeyMapper - 0x30000) & 0xffff;
++  if (first - expect > 0x40 || expect - first > 0x40)
++    return false;
++  for (int i = 1; i < 136; i++) {
++    int v = _be16_at(img, L.KeyMapperIndex + i * 2);
++    if (v < first - 0x40 || v > first + 0x4000)
++      return false;
++  }
++  return true;
++}
++
++/* Shift every offset of a plain-int offset struct */
++template <typename T> static T _shift_lut(const T &base, int delta)
++{
++  T out = base;
++  int *p = (int *) &out;
++  for (size_t i = 0; i < sizeof(T) / sizeof(int); i++)
++    p[i] += delta;
++  return out;
++}
++
++static std::vector<uint8_t> _read_image(std::ifstream &f)
++{
++  f.clear();
++  f.seekg(0, std::ios::end);
++  std::streamoff n = f.tellg();
++  std::vector<uint8_t> img((size_t) n);
++  f.seekg(0);
++  f.read(reinterpret_cast<char *>(img.data()), n);
++  return img;
++}
++
++
+ int ControlRom::_read_lookup_tables_progrom(std::ifstream &romFile)
+ {
+   int numVCurves = 10;
+   const struct _ProgMemoryMapLUT *PROGmmLUT;
++  bool stockVersion = false;
+   switch(_synthModel)
+     {
+     case SynthModel::sm_SC55:
++    case SynthModel::sm_SCC1:
+       PROGmmLUT = &SC55_1_21_Prog_LUT;
+       numVCurves = 10;
++      stockVersion = _synthModel == sm_SC55 && !_version.compare(0, 4, "1.21");
+       break;
+     case SynthModel::sm_SC55mkII:
+       PROGmmLUT = &SC55mkII_1_01_Prog_LUT;
+       numVCurves = 12;
++      stockVersion = !_version.compare(0, 4, "1.01");
+       break;
+     default:
+-      std::cerr << "libEmuSC: Unsupported ROM file!" << std::endl;
+-      exit(0);
++      throw(std::string("Unsupported control ROM model (lookup tables)"));
++    }
++
++  std::vector<uint8_t> img = _read_image(romFile);
++  struct _ProgMemoryMapLUT eff = *PROGmmLUT;
++
++  if (_verify_prog_lut(img, eff, numVCurves)) {
++    _lutSrcProg = stockVersion ? LutSource::Stock : LutSource::Verified;
++    _lutDeltaProg = 0;
++  } else {
++    bool found = false;
++    int span = (int) img.size();
++    for (int d = 2; d < span && !found; d += 2) {       // tables are even-aligned
++      for (int s = 0; s < 2 && !found; s++) {
++        int delta = s ? -d : d;
++        if (!_fits(img, PROGmmLUT->VelocityCurves + delta, 128))
++          continue;
++        struct _ProgMemoryMapLUT cand = _shift_lut(*PROGmmLUT, delta);
++        if (_verify_prog_lut(img, cand, numVCurves)) {
++          eff = cand;
++          _lutSrcProg = LutSource::Scanned;
++          _lutDeltaProg = delta;
++          found = true;
++        }
++      }
+     }
++    if (!found)
++      throw(std::string("Unsupported control ROM version (") + _model + " " +
++            _version + "): program lookup tables not found");
++  }
+ 
+   lookupTables.VelocityCurves.resize(128 * numVCurves);
+-  romFile.seekg(PROGmmLUT->VelocityCurves);
+-  romFile.read(reinterpret_cast<char*> (lookupTables.VelocityCurves.data()),
+-               lookupTables.VelocityCurves.size());
++  memcpy(lookupTables.VelocityCurves.data(), &img[eff.VelocityCurves],
++         lookupTables.VelocityCurves.size());
+ 
+-  _read_lut_16bit(romFile, PROGmmLUT->KeyMapperIndex,
+-                  lookupTables.KeyMapperIndex);
++  for (int i = 0; i < 136; i++)
++    lookupTables.KeyMapperIndex[i] = _be16_at(img, eff.KeyMapperIndex + i * 2);
+ 
+-  int kmSize = 128 +
+-    lookupTables.KeyMapperIndex.back() - lookupTables.KeyMapperIndex.front();
++  int kmSpan = 0;     // the index holds addresses, not a sorted list
++  for (int i = 0; i < 136; i++) {
++    int d = lookupTables.KeyMapperIndex[i] - lookupTables.KeyMapperIndex.front();
++    if (d > kmSpan) kmSpan = d;
++  }
++  int kmSize = 128 + kmSpan;
+   lookupTables.KeyMapper.resize(kmSize);
+-
+-  romFile.seekg(PROGmmLUT->KeyMapper);
+-  romFile.read(reinterpret_cast<char*> (lookupTables.KeyMapper.data()), kmSize);
+-  lookupTables.KeyMapperOffset = PROGmmLUT->KeyMapper - 0x30000;
++  if (!_fits(img, eff.KeyMapper, kmSize))
++    throw(std::string("Control ROM key mapper out of range"));
++  memcpy(lookupTables.KeyMapper.data(), &img[eff.KeyMapper], kmSize);
++  lookupTables.KeyMapperOffset = eff.KeyMapper - 0x30000;
+ 
+   return 0;
+ }
+@@ -595,19 +770,54 @@
+ int ControlRom::_read_lookup_tables_cpurom(std::ifstream &romFile)
+ {
+   const struct _CPUMemoryMapLUT *CPUmmLUT;
++  bool stockVersion = false;
+   switch(_synthModel)
+     {
+     case SynthModel::sm_SC55:
++    case SynthModel::sm_SCC1:
+       CPUmmLUT = &SC55_1_21_CPU_LUT;
++      stockVersion = _synthModel == sm_SC55 && !_version.compare(0, 4, "1.21");
+       break;
+     case SynthModel::sm_SC55mkII:
+       CPUmmLUT = &SC55mkII_1_01_CPU_LUT;
++      stockVersion = !_version.compare(0, 4, "1.01");
+       break;
+     default:
+-      std::cerr << "libEmuSC: Unsupported ROM file!" << std::endl;
+-      exit(0);
++      throw(std::string("Unsupported control ROM model (lookup tables)"));
+     }
+ 
++  struct _CPUMemoryMapLUT eff = *CPUmmLUT;
++  {
++    std::vector<uint8_t> img = _read_image(romFile);
++
++    if (_verify_cpu_lut(img, eff)) {
++      _lutSrcCpu = stockVersion ? LutSource::Stock : LutSource::Verified;
++      _lutDeltaCpu = 0;
++    } else {
++      bool found = false;
++      int span = (int) img.size();
++      for (int d = 2; d < span && !found; d += 2) {
++        for (int s = 0; s < 2 && !found; s++) {
++          int delta = s ? -d : d;
++          int sine = CPUmmLUT->LFOSine + delta;
++          if (!_fits(img, sine, 130) || img[sine] > 4 || img[sine + 64] < 250)
++            continue;                                   // cheap pre-check
++          struct _CPUMemoryMapLUT cand = _shift_lut(*CPUmmLUT, delta);
++          if (_verify_cpu_lut(img, cand)) {
++            eff = cand;
++            _lutSrcCpu = LutSource::Scanned;
++            _lutDeltaCpu = delta;
++            found = true;
++          }
++        }
++      }
++      if (!found)
++        throw(std::string("Unsupported CPU ROM version (") + _model + " " +
++              _version + "): lookup tables not found");
++    }
++  }
++  CPUmmLUT = &eff;      // the verified or shifted offsets
++
+   // 8-bit values
+   romFile.seekg(CPUmmLUT->EnvTimeKeyFollowSens);
+   romFile.read(reinterpret_cast<char*> (&lookupTables.EnvTimeKeyFollowSens),21);
+diff -ruN /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/control_rom.h emusc/libemusc/src/control_rom.h
+--- /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/control_rom.h	2026-11-07 19:34:19.204883000 -0800
++++ emusc/libemusc/src/control_rom.h	2026-11-07 19:51:47.355962000 -0800
+@@ -237,6 +237,16 @@
+   std::string date(void) { return _date; }
+   enum SynthGen generation(void) { return _synthGeneration; }
+ 
++  /* PRISM: where the lookup tables were found. Stock = the known offsets of
++   * a known firmware build; Verified = the known offsets fitted another
++   * build; Scanned = the tables were located by their shape at an offset
++   * delta from the known build. */
++  enum class LutSource { Stock = 0, Verified = 1, Scanned = 2 };
++  LutSource lut_source_prog(void) { return _lutSrcProg; }
++  LutSource lut_source_cpu(void) { return _lutSrcCpu; }
++  int lut_delta_prog(void) { return _lutDeltaProg; }
++  int lut_delta_cpu(void) { return _lutDeltaCpu; }
++
+   const std::array<uint8_t, 128>& get_drum_sets_LUT(void) { return _drumSetsLUT; }
+   const uint8_t max_polyphony(void);
+ 
+@@ -353,6 +363,17 @@
+   int _identify_model(std::ifstream &romFile);
+   const std::vector<uint32_t> &_banks(void);
+ 
++  // PRISM: lookup-table location state and the shape checks behind it
++  LutSource _lutSrcProg = LutSource::Stock;
++  LutSource _lutSrcCpu = LutSource::Stock;
++  int _lutDeltaProg = 0;
++  int _lutDeltaCpu = 0;
++
++  bool _verify_cpu_lut(const std::vector<uint8_t> &img,
++                       const struct _CPUMemoryMapLUT &L);
++  bool _verify_prog_lut(const std::vector<uint8_t> &img,
++                        const struct _ProgMemoryMapLUT &L, int numVCurves);
++
+   // To be replaced with std::endian::native from C++20
+   inline bool _le_native(void) { uint16_t n = 1; return (*(uint8_t *) & n); } 
+ 
+diff -ruN /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/envelope.cc emusc/libemusc/src/envelope.cc
+--- /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/envelope.cc	2026-11-07 19:34:19.211359000 -0800
++++ emusc/libemusc/src/envelope.cc	2026-11-07 20:25:15.573222100 -0800
+@@ -26,7 +26,16 @@
+ 
+ 
+ Envelope::Envelope(ControlRom::LookupTables &LUT)
+-  : _finished(false),
++  : _phaseDuration(0),
++    _phaseStepSize(0),
++    _phasePosition(0),
++    _phaseRemainder(0),
++    _finished(false),
++    _phaseSampleIndex(0),
++    _phaseSampleNum(0),
++    _phaseSampleLen(0),
++    _phaseStartValue(0),
++    _phaseEndValue(0),
+     _envelopeOut(0),
+     _timeKeyFlwT1T4(256),
+     _timeKeyFlwT5(256),
+@@ -34,7 +43,18 @@
+     _timeVelSensT3T5(256),
+     _phase(Phase::Init),
+     _LUT(LUT)
+-{}
++{
++  /* The derived classes fill these from the instrument definition, but the
++   * pre-run of the phase logic reads some of them first; they must not
++   * carry whatever the heap held, or two identical notes can differ. */
++  for (int i = 0; i < 6; i++) {
++    _phaseLevel[i] = 0;
++    _phaseTime[i] = 0;
++    _phaseValueInit[i] = 0;
++    _phaseDurationInit[i] = 0;
++    _phaseShape[i] = 0;
++  }
++}
+ 
+ 
+ Envelope::~Envelope()
+diff -ruN /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/note.cc emusc/libemusc/src/note.cc
+--- /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/note.cc	2026-11-07 19:34:19.225553300 -0800
++++ emusc/libemusc/src/note.cc	2026-11-07 19:49:09.831649700 -0800
+@@ -19,18 +19,25 @@
+ 
+ #include "note.h"
+ 
++#include <algorithm>
+ #include <bitset>
++#include <climits>
+ #include <iostream>
+ #include <cmath>
+ 
+ namespace EmuSC {
+ 
+ 
++/* Only touched on the MIDI/audio thread, so a plain counter is enough. */
++static uint32_t s_noteSeq = 0;
++
+ Note::Note(uint8_t key, uint8_t velocity, ControlRom &ctrlRom, WaveRom &waveRom,
+-	   Settings *settings, int8_t partId)
++	   Settings *settings, int8_t partId, const int *portaSrc)
+   : _key(key),
+     _sustain(false),
+     _stopped(false),
++    _noteOff(false),
++    _seq(++s_noteSeq),
+     _7bScale(1/127.0),
+     _settings(settings),
+     _partId(partId)
+@@ -62,7 +69,8 @@
+   if (partialBits.test(0)) {
+     try {
+       _partial[0] = new Partial(0, key, velocity, instrumentIndex, ctrlRom,
+-				waveRom, _LFO1, settings, partId);
++				waveRom, _LFO1, settings, partId,
++				portaSrc ? portaSrc[0] : INT_MIN);
+     } catch (std::string errorMsg) {
+       _partial[0] = NULL;
+     }
+@@ -70,7 +78,8 @@
+   if (partialBits.test(1)) {
+     try {
+       _partial[1] = new Partial(1, key, velocity, instrumentIndex, ctrlRom,
+-				waveRom, _LFO1, settings, partId);
++				waveRom, _LFO1, settings, partId,
++				portaSrc ? portaSrc[1] : INT_MIN);
+     } catch (std::string errorMsg) {
+       _partial[1] = NULL;
+     }
+@@ -93,6 +102,8 @@
+     _stopped = true;
+ 
+   } else {
++    _noteOff = true;
++
+     if (_partial[0])
+       _partial[0]->stop();
+ 
+@@ -105,8 +116,12 @@
+ void Note::stop(uint8_t key)
+ {
+   if (key == _key) {
+-    if (_sustain)                       // Hold pedal (hold1) or Sostenuto
+-      _stopped = true;
++    if (_sustain) {                     // Hold pedal (hold1) or Sostenuto
++      _stopped = true;                  // released when the pedal lifts
++      return;
++    }
++
++    _noteOff = true;
+ 
+     if (_partial[0])
+       _partial[0]->stop();
+@@ -204,4 +219,35 @@
+   return _partial[partial]->get_current_tva();
+ }
+ 
++
++bool Note::releasing(void)
++{
++  return _noteOff;
++}
++
++
++int Note::tva_max(void)
++{
++  int v = 0;
++  if (_partial[0]) v = _partial[0]->get_current_tva();
++  if (_partial[1]) v = std::max(v, _partial[1]->get_current_tva());
++  return v;
++}
++
++
++int Note::porta_base(int partial)
++{
++  if (partial < 0 || partial > 1 || !_partial[partial])
++    return INT_MIN;
++  return _partial[partial]->porta_base();
++}
++
++
++int Note::porta_now(int partial)
++{
++  if (partial < 0 || partial > 1 || !_partial[partial])
++    return INT_MIN;
++  return _partial[partial]->porta_now();
++}
++
+ }
+diff -ruN /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/note.h emusc/libemusc/src/note.h
+--- /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/note.h	2026-11-07 19:34:19.233936600 -0800
++++ emusc/libemusc/src/note.h	2026-11-07 19:48:21.645938700 -0800
+@@ -37,8 +37,10 @@
+ class Note
+ {
+ public:
++  /* portaSrc: per-partial glide source pitch (key * 1000 scale) or INT32_MIN
++   * for no glide. May be NULL. */
+   Note(uint8_t key, uint8_t velocity, ControlRom &ctrlRom, WaveRom &waveRom,
+-       Settings *settings, int8_t partId);
++       Settings *settings, int8_t partId, const int *portaSrc = 0);
+   ~Note();
+ 
+   void stop(void);
+@@ -56,11 +58,20 @@
+   int get_current_tva(bool partial);
+   int get_current_lfo(int lfo);
+ 
++  /* PRISM: voice stealing and portamento helpers */
++  inline uint32_t seq(void) const { return _seq; }
++  bool releasing(void);          // partials released (note off reached them)
++  int  tva_max(void);            // loudest partial's current TVA level
++  int  porta_base(int partial);  // partial's base pitch; INT32_MIN if absent
++  int  porta_now(int partial);   // base plus any glide still in progress
++
+ private:
+   uint8_t _key;
+ 
+   bool _sustain;
+   bool _stopped;
++  bool _noteOff;                 // stop() reached the partials
++  uint32_t _seq;                 // creation order, for last-note priority
+ 
+   const double _7bScale;     // Constant: 1 / 127
+ 
+diff -ruN /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/part.cc emusc/libemusc/src/part.cc
+--- /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/part.cc	2026-11-07 19:34:19.248604700 -0800
++++ emusc/libemusc/src/part.cc	2026-11-07 19:48:08.395303700 -0800
+@@ -20,6 +20,7 @@
+ #include "part.h"
+ 
+ #include <algorithm>
++#include <climits>
+ #include <cmath>
+ #include <iostream>
+ 
+@@ -32,12 +33,20 @@
+     _lastPeakSample(0),
+     _ctrlRom(ctrlRom),
+     _waveRom(waveRom),
+-    _lastPitchBendRange(2)
++    _lastPitchBendRange(2),
++    _busActive(false),
++    _choSend(0),
++    _revSend(0),
++    _portaCtrlKey(-1)
+ {
+   // TODO: Rename mode => synthMode and set proper defaults for MT32 mode
+   _notesMutex = new std::mutex();
+ 
+   _partialReserve = 2;           // TODO: Add this to settings with propoer val
++
++  _busDry[0].fill(0.0f);
++  _busDry[1].fill(0.0f);
++  _lastBase[0] = _lastBase[1] = INT_MIN;
+ }
+ 
+ 
+@@ -49,14 +58,17 @@
+ 
+ 
+ // All Sound Canvas modules generates 256 samples per control update.
+-int Part::get_sample_set(std::array<std::array<float, 256>, 2> &dryBus,
+-			 std::array<std::array<float, 256>, 2> &chorusBus,
+-			 std::array<std::array<float, 256>, 2> &reverbBus)
++// The part renders into its own buffers; the synth sums them afterwards.
++void Part::render_block(void)
+ {
+   _notesMutex->lock();
+ 
++  _busActive = _notes.size() > 0;
++
+   // Only process notes if we have any
+-  if (_notes.size() > 0) {
++  if (_busActive) {
++    _busDry[0].fill(0.0f);
++    _busDry[1].fill(0.0f);
+ 
+     // TODO: Figure out a proper way to efficiently calculate new controller
+     //       values when needed. Is PitchBend the only one that needs this?
+@@ -69,10 +81,9 @@
+     // Get next sample from active notes, delete those which are finished
+     std::list<Note*>::iterator itr = _notes.begin();
+     while (itr != _notes.end()) {
+-      bool finished = (*itr)->get_sample_set(dryBus);
++      bool finished = (*itr)->get_sample_set(_busDry);
+ 
+       if (finished) {
+- //      std::cout << "Both partials have finished -> delete note" << std::endl;
+         delete *itr;
+         itr = _notes.erase(itr);
+       } else {
+@@ -81,22 +92,12 @@
+     }
+ 
+     // Store last (highest) value for future queries (typically for bar display)
+-    auto itL = std::max_element(dryBus[0].begin(), dryBus[0].end());
+-    _lastPeakSample = *itL;
+-    auto itR = std::max_element(dryBus[0].begin(), dryBus[0].end());
+-    _lastPeakSample = std::max(_lastPeakSample, *itR);
+-
+-    float chorusSL = _settings->get_param(PatchParam::ChorusSendLevel, _id) / 128.0f;
+-    chorusBus = dryBus;
+-    auto& elementC = reinterpret_cast<float(&)[2 * 256]>(chorusBus);
+-    for (size_t i = 0; i < 2 * 256; ++i)
+-      elementC[i] *= chorusSL;
+-
+-    float reverbSL = _settings->get_param(PatchParam::ReverbSendLevel, _id) / 128.0f;
+-    reverbBus = dryBus;
+-    auto& elementR = reinterpret_cast<float(&)[2 * 256]>(reverbBus);
+-    for (size_t i = 0; i < 2 * 256; ++i)
+-      elementR[i] *= reverbSL;
++    float pk = *std::max_element(_busDry[0].begin(), _busDry[0].end());
++    pk = std::max(pk, *std::max_element(_busDry[1].begin(), _busDry[1].end()));
++    _lastPeakSample = pk;
++
++    _choSend = _settings->get_param(PatchParam::ChorusSendLevel, _id) / 128.0f;
++    _revSend = _settings->get_param(PatchParam::ReverbSendLevel, _id) / 128.0f;
+   }
+ 
+   // Export envelopes and LFOs to external client
+@@ -118,8 +119,44 @@
+   }
+ 
+   _notesMutex->unlock();
++}
+ 
+-  return 0;
++
++/* PRISM: the part's best victim for voice stealing. Lower score = better:
++ * a releasing note scores its current TVA level (quiet tails go first), a
++ * sounding note scores far above that, oldest first. */
++Note *Part::steal_candidate(long *score)
++{
++  Note *best = NULL;
++  long bs = 0;
++  _notesMutex->lock();
++  for (auto n : _notes) {
++    long s;
++    if (n->releasing())
++      s = n->tva_max();
++    else
++      s = 0x10000L + (long) n->seq();
++    if (!best || s < bs) { best = n; bs = s; }
++  }
++  _notesMutex->unlock();
++  if (best) *score = bs;
++  return best;
++}
++
++
++int Part::kill_note(Note *n)
++{
++  int freed = 0;
++  _notesMutex->lock();
++  for (std::list<Note*>::iterator it = _notes.begin(); it != _notes.end(); ++it)
++    if (*it == n) {
++      freed = n->get_num_partials();
++      delete n;
++      _notes.erase(it);
++      break;
++    }
++  _notesMutex->unlock();
++  return freed;
+ }
+ 
+ 
+@@ -213,7 +250,28 @@
+     v *= (velSensOffset + 64) / 127.0;
+   uint8_t velocity = (v <= 127) ? std::roundf(v) : 127;
+ 
+-  // 6. Remove all existing notes if part is in mono mode according to the
++  // 6. Portamento: pick the glide source before mono mode clears the list.
++  //    CC 84 names the source key for this one note; otherwise the glide
++  //    starts from the previous note's pitch - mid-glide, its current pitch.
++  int portaSrc[2] = { INT_MIN, INT_MIN };
++  int pCtrl = _portaCtrlKey;
++  _portaCtrlKey = -1;
++  if (_settings->get_param(PatchParam::Portamento, _id) &&
++      _settings->get_param(PatchParam::UseForRhythm, _id) == mode_Norm) {
++    if (pCtrl >= 0) {
++      portaSrc[0] = portaSrc[1] = pCtrl * 1000;
++    } else {
++      _notesMutex->lock();
++      Note *prev = _notes.empty() ? NULL : _notes.back();
++      for (int s = 0; s < 2; s++) {
++        int v = prev ? prev->porta_now(s) : INT_MIN;
++        portaSrc[s] = (v != INT_MIN) ? v : _lastBase[s];
++      }
++      _notesMutex->unlock();
++    }
++  }
++
++  // 7. Remove all existing notes if part is in mono mode according to the
+   //    SC-55 owner's manual page 39
+   if (_settings->get_param(PatchParam::PolyMode, _id) == false &&
+       _settings->get_param(PatchParam::UseForRhythm, _id) == mode_Norm)
+@@ -221,20 +279,21 @@
+ 
+   _notesMutex->lock();
+ 
+-  Note *n = new Note(key, velocity, _ctrlRom, _waveRom, _settings, _id);
++  Note *n = new Note(key, velocity, _ctrlRom, _waveRom, _settings, _id,
++                     portaSrc);
+   _notes.push_back(n);
+ 
+   _notesMutex->unlock();
+ 
++  // Remember this note's pitch as the next glide source
++  for (int s = 0; s < 2; s++) {
++    int v = n->porta_base(s);
++    if (v != INT_MIN) _lastBase[s] = v;
++  }
++
+   if (_settings->get_param(PatchParam::Hold1, _id))
+       n->sustain(true);
+ 
+-  if (0)
+-    std::cout << "EmuSC: New note [ part=" << (int) _id
+-	      << " key=" << (int) key
+-	      << " velocity=" << (int) velocity
+-	      << " ]" << std::endl;
+-  
+   return 1;
+ }
+ 
+@@ -409,6 +468,7 @@
+ 
+   } else if (msgId == 84) {                            // Portamento control
+     _settings->set_param(PatchParam::PortamentoControl, value, _id);
++    _portaCtrlKey = value & 0x7f;    // glide source for the next note only
+ 
+   } else if (msgId == 91) {                            // Reverb
+     _settings->set_param(PatchParam::ReverbSendLevel, value, _id);
+@@ -479,12 +539,13 @@
+ }
+ 
+ 
++/* The SC-55 keeps one poly pressure value per part (address 0x1084), so the
++ * last key pressure received drives the PAf controller routing. */
+ int Part::poly_key_pressure(uint8_t key, uint8_t value)
+ {
+-  std::cout << "Polyphonic key pressure not implemented (ch="
+-	    << _settings->get_param(PatchParam::RxChannel, _id)
+-	    << ", key=" << (int) key << ", value=" << value << ")"
+-	    << std::endl;
++  (void) key;
++  if (_settings->get_param(PatchParam::RxPolyPressure, _id))
++    _settings->set_param(PatchParam::PolyKeyPressure, value, _id);
+ 
+   return 0;
+ }
+@@ -530,6 +591,9 @@
+   _partialReserve = 2;
+ 
+   _lastPeakSample = 0;
++  _busActive = false;
++  _lastBase[0] = _lastBase[1] = INT_MIN;
++  _portaCtrlKey = -1;
+ }
+ 
+ 
+diff -ruN /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/part.h emusc/libemusc/src/part.h
+--- /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/part.h	2026-11-07 19:34:19.258155100 -0800
++++ emusc/libemusc/src/part.h	2026-11-07 19:46:57.957534400 -0800
+@@ -43,9 +43,22 @@
+   Part(uint8_t id, Settings *settings, ControlRom &cRom, WaveRom &wRom);
+   ~Part();
+ 
+-  int get_sample_set(std::array<std::array<float, 256>, 2> &dryBus,
+-		     std::array<std::array<float, 256>, 2> &chrousBus,
+-		     std::array<std::array<float, 256>, 2> &reverbBus);
++  /* PRISM: the part renders one 256-sample block into its own buffers; the
++   * synth sums them with this part's send levels. Parts are independent, so
++   * blocks can render on separate threads. */
++  void render_block(void);
++  inline const std::array<std::array<float, 256>, 2> &dry_bus(void) const
++  { return _busDry; }
++  inline bool  bus_active(void) const { return _busActive; }
++  inline float chorus_send(void) const { return _choSend; }
++  inline float reverb_send(void) const { return _revSend; }
++
++  /* PRISM: voice stealing. The candidate is this part's best victim (lowest
++   * score; releasing and quiet beats merely old). kill_note removes and
++   * frees it, returning the partials freed. Audio thread only. */
++  Note *steal_candidate(long *score);
++  int kill_note(Note *n);
++
+   void update(void);
+ 
+   int get_last_peak_sample(void);
+@@ -108,6 +121,17 @@
+   // TODO: Figure out how to do this properly. Only relevant for pitchBend?
+   uint8_t _lastPitchBendRange;
+ 
++  // PRISM: the part's own render buffers and send levels for this block
++  std::array<std::array<float, 256>, 2> _busDry;
++  bool _busActive;
++  float _choSend, _revSend;
++
++  // PRISM: portamento is a per-part affair: the glide source is the pitch of
++  // the part's previous note (its current pitch while it still glides), or
++  // the key set by CC 84. One value per partial slot; INT32_MIN = none yet.
++  int _lastBase[2];
++  int _portaCtrlKey;            // CC 84 source key for the next note, -1 none
++
+   // Envelopes and LFOs callback for external clients
+   std::function<void(const int)> _changeCallback = NULL;
+   std::function<void(const float, const float,
+diff -ruN /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/partial.cc emusc/libemusc/src/partial.cc
+--- /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/partial.cc	2026-11-07 19:34:19.266975900 -0800
++++ emusc/libemusc/src/partial.cc	2026-11-07 20:21:07.155134500 -0800
+@@ -42,6 +42,7 @@
+ 
+ #include "partial.h"
+ 
++#include <climits>
+ #include <iostream>
+ #include <cmath>
+ 
+@@ -51,7 +52,8 @@
+ 
+ Partial::Partial(int partialId, uint8_t key, uint8_t velocity,
+ 		 uint16_t instrumentIndex, ControlRom &ctrlRom, WaveRom &waveRom,
+-		 WaveGenerator *LFO1, Settings *settings, int8_t partId)
++		 WaveGenerator *LFO1, Settings *settings, int8_t partId,
++		 int portaSrc)
+   : _instPartial(ctrlRom.instrument(instrumentIndex).partials[partialId]),
+     _settings(settings),
+     _partId(partId),
+@@ -68,7 +70,7 @@
+   _LFO2 = new WaveGenerator(_instPartial, ctrlRom.lookupTables,settings,partId);
+ 
+   _pitch = new Pitch(ctrlRom, instrumentIndex, partialId, key, velocity, LFO1,
+-                     _LFO2, settings, partId);
++                     _LFO2, settings, partId, portaSrc);
+ 
+   _tvf = new TVF(_instPartial, key, velocity, LFO1, _LFO2,
+                  ctrlRom.lookupTables, settings, partId);
+@@ -79,19 +81,14 @@
+ 
+   _ctrlSample = &ctrlRom.sample(sampleIndex);
+   _pcmSamples = &waveRom.samples(sampleIndex).samplesF;
++  /* A gliding note starts at the sample's portamento offset, skipping the
++   * attack transient, as the sample control data prescribes. */
+   _waveOscillator = new WaveOscillator(_ctrlSample, _pcmSamples,
+-                                       std::bind(&Partial::first_run_cb, this));
++                                       std::bind(&Partial::first_run_cb, this),
++                                       _pitch->gliding());
+ 
+-  // FIXME: A few sample definitions in the SC-55 ROM have loop length >
+-  // sample length. This makes EmuSC crash as it loops outside range. The
+-  // following hack prevents a crash, but audio is wrong for these samples.
+-  // TODO: Figure out why this works on the real hardware.
+-  // Example: Concert Cym. (Con_sym), #59 of Orchestra drumkit
+-  if (_ctrlSample->loopLen > _ctrlSample->sampleLen) {
+-    std::cerr << "libEmuSC: Internal error, loop length > sample length!"
+-              << std::endl << " => loop length = sample length" << std::endl;
+-    _ctrlSample->loopLen = _ctrlSample->sampleLen;
+-  }
++  // Samples with loop length > sample length are healed by ControlRom when
++  // the ROM is read, so every note sees the same control data.
+ }
+ 
+ 
+@@ -151,6 +148,18 @@
+ }
+ 
+ 
++int Partial::porta_base(void)
++{
++  return _pitch ? _pitch->porta_base() : INT_MIN;
++}
++
++
++int Partial::porta_now(void)
++{
++  return _pitch ? _pitch->porta_now() : INT_MIN;
++}
++
++
+ void Partial::first_run_cb(void)
+ {
+   // Looping samples have their pitch tuned after the first loop point
+diff -ruN /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/partial.h emusc/libemusc/src/partial.h
+--- /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/partial.h	2026-11-07 19:34:19.278979600 -0800
++++ emusc/libemusc/src/partial.h	2026-11-07 19:49:11.502821400 -0800
+@@ -41,9 +41,11 @@
+ class Partial
+ {
+ public:
++  /* portaSrc: glide source pitch (key * 1000 scale), INT32_MIN = no glide */
+   Partial(int partialId, uint8_t key, uint8_t velocity,
+ 	  uint16_t instrumentIndex, ControlRom &controlRom, WaveRom &waveRom,
+-	  WaveGenerator *LFO1, Settings *settings, int8_t partId);
++	  WaveGenerator *LFO1, Settings *settings, int8_t partId,
++	  int portaSrc);
+   ~Partial();
+ 
+   bool get_sample_set(std::array<std::array<float, 256>, 2> &dryBus);
+@@ -53,6 +55,10 @@
+ 
+   void first_run_cb(void);
+ 
++  /* PRISM: portamento state, for the part's next glide */
++  int porta_base(void);
++  int porta_now(void);
++
+   inline int get_current_lfo(void)
+   { if (_LFO2) return _LFO2->value(); return 0; }
+   int get_current_pitch(void)
+diff -ruN /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/pitch.cc emusc/libemusc/src/pitch.cc
+--- /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/pitch.cc	2026-11-07 19:34:19.289436800 -0800
++++ emusc/libemusc/src/pitch.cc	2026-11-07 20:28:03.348715200 -0800
+@@ -35,14 +35,10 @@
+ namespace EmuSC {
+ 
+ 
+-int Pitch::_portaTargetPitch = 0;
+-std::array<int, 28> Pitch::_portaBasePitch = {};
+-int Pitch::_pbpIndex = -1;
+-
+-
+ Pitch::Pitch(ControlRom &ctrlRom, uint16_t instrumentIndex, int partialId,
+              uint8_t key, uint8_t velocity, WaveGenerator *LFO1,
+-             WaveGenerator *LFO2, Settings *settings, int8_t partId)
++             WaveGenerator *LFO2, Settings *settings, int8_t partId,
++             int portaSrc)
+   : Envelope(ctrlRom.lookupTables),
+     _firstUpdate(true),
+     _key(key),
+@@ -55,11 +51,32 @@
+     _LFO2(LFO2),
+     _lfo1FadeComplete(false),
+     _lfo2FadeComplete(false),
++    _lfo1Depth(0),
++    _lfo2Depth(0),
++    _envTimeKeyFlwT14(0x100),
++    _envTimeKeyFlwT5(0x100),
++    _envTimeVelSens(0x100),
++    _isAscending(false),
++    _envVelSens(0),
+     _sampleIndex(0xffff),
++    _samplePitchOffsetInit(0),
++    _samplePitchOffsetSust(0),
++    _samplePitchOffsetActive(0),
++    _portamentoDelta(0),
++    _releasePitch(0),
++    _targetPitch(0),
+     _cachedPFineTune(0),
++    _cachedPFineTuneOffset(0),
++    _phaseIncrement(0),
++    _currentInc(0),
++    _deltaInc(0),
+     _settings(settings),
+-    _partId(partId)
++    _partId(partId),
++    _portaMyBase(0),
++    _portaSrc(portaSrc)
+ {
++  _dKey = key;
++  for (int i = 0; i < 8; i++) _envPhaseRate[i] = 0;
+   if (_drumSet)
+     _dKey = _settings->get_param(DrumParam::PlayKeyNumber, _drumSet, key);
+ 
+@@ -321,39 +338,10 @@
+ }
+ 
+ 
+-int Pitch::_init_portamento(bool portamento, bool legato)
+-{
+-  int delta = 0;
+-
+-  if (portamento) {
+-    int pControl = _settings->get_param(PatchParam::PortamentoControl, _partId);
+-    if (pControl != 0xFF) {
+-      uint32_t scaled = pControl * 1000;
+-      delta = (int32_t) scaled - _portaBasePitch[_pbpIndex];
+-    }
+-
+-  } else {
+-    delta = _portaTargetPitch - _portaBasePitch[_pbpIndex];
+-  }
+-
+-  if (0)
+-    std::cout << "Pitch init portamento(portamento=" << portamento
+-              << ", legato=" << legato << ") delta=" << delta << std::endl;
+-
+-  // If legato, accumulate instead of reset
+-  if (legato)
+-    return _portamentoDelta + delta;
+-
+-  return delta;
+-}
+-
+-
+ void Pitch::_init_envelope(uint8_t velocity)
+ {
+-  // Portamento Target Pitch is a static / global variable for target pitch.
+-  if (++_pbpIndex >= 24) _pbpIndex = 0;
+-  _portaTargetPitch = _portaBasePitch[_pbpIndex];
+-  _portaBasePitch[_pbpIndex] = (_basePitchC * 1000) + _basePitchF;
++  // This partial's fully corrected base pitch, in key * 1000 units.
++  _portaMyBase = (_basePitchC * 1000) + _basePitchF;
+ 
+   int srKey = _ctrlRom.sample(_sampleIndex).rootKey * 1000;
+   int sfPitch =  _ctrlRom.sample(_sampleIndex).pitchInit - 1024;
+@@ -364,35 +352,23 @@
+   _samplePitchOffsetActive = _samplePitchOffsetInit;
+ 
+   int pitchCurve = _ctrlRom.instrument(_instrumentIndex).pitchCurve;
+-  _portaBasePitch[_pbpIndex] += _get_pitch_curve_correction(pitchCurve);
++  _portaMyBase += _get_pitch_curve_correction(pitchCurve);
+ 
+-  _portaBasePitch[_pbpIndex] += (_instPartial.finePitch - 0x40) * 10;
+-  _portaBasePitch[_pbpIndex] = std::max(0, _portaBasePitch[_pbpIndex]);
++  _portaMyBase += (_instPartial.finePitch - 0x40) * 10;
++  _portaMyBase = std::max(0, _portaMyBase);
+ 
+   int8_t rnd = static_cast<int8_t>((std::rand() % 0xffff) >> 8);
+   int16_t delta = ((rnd < 0 ? -rnd : rnd) * _instPartial.randPitch + 0x80) >> 8;
+-  _portaBasePitch[_pbpIndex] += (rnd < 0 ? -delta : delta) * 10;
++  _portaMyBase += (rnd < 0 ? -delta : delta) * 10;
+   _phaseLevel[4] += (rnd < 0 ? -delta : delta) * 10;
+ 
+-  // calculate the 0xffc5: Portamento needs to be on, mono mode
+-  int pOn = _settings->get_param(PatchParam::Portamento, _partId); // 1 = On
+-  int pMode = _settings->get_param(PatchParam::PolyMode, _partId); // 0 = mono
+-  // But how do we know of other keys being down? legato is trouble..
+-  bool usePortamento = (pOn && !pMode) ? true : false;
+-  _portamentoDelta = usePortamento ? _init_portamento(usePortamento, 0) : 0;
+-
+-  int pCtrl = _settings->get_param(PatchParam::PortamentoControl, _partId) +
+-              _instPartial.coarsePitch - 0x40;
+-  pCtrl = std::clamp(pCtrl, 0, 0x7f);
+-
+-  if (0)
+-    std::cout << "TMP PORTAMENTO CTRL=" << pCtrl
+-              << " On=" << pOn
+-              << " polyMode=" << pMode
+-              << std::endl;
+-
+-  // TODO: PORTAMENTO NOT COMPLETE!
+-
++  /* Portamento: the part hands down the glide source pitch (the previous
++   * note's current pitch, or the CC 84 key). The glide is the difference,
++   * worked off at the PortamentoRate in _iterate_phase(). */
++  if (_portaSrc != INT32_MIN)
++    _portamentoDelta = _portaSrc - _portaMyBase;
++  else
++    _portamentoDelta = 0;
+ 
+   // Find Pitch Envelope Velocity Sensitvity
+   int pitchEnvVSensRom = _instPartial.pitchEnvVSens - 0x40;
+@@ -430,8 +406,8 @@
+       prod =  (_envVelSens * 0xff) << 1;
+     int res = (prod >> 8) & 0xffff;
+ 
+-    _phaseLevel[i] = (phaseLevelRom[i] >= 0) ? _portaBasePitch[_pbpIndex] + res
+-                                             : _portaBasePitch[_pbpIndex] - res;
++    _phaseLevel[i] = (phaseLevelRom[i] >= 0) ? _portaMyBase + res
++                                             : _portaMyBase - res;
+     _phaseLevel[i] = std::max(_phaseLevel[i], 0);
+   }
+ 
+@@ -660,8 +636,12 @@
+ void Pitch::_init_new_phase(enum Phase newPhase)
+ {
+   if (newPhase == Phase::Init) {
+-    std::cerr << "libEmuSC: Internal error, envelope in illegal state"
+-	      << std::endl;
++    static bool warned = false;
++    if (!warned) {
++      warned = true;
++      std::cerr << "libEmuSC: Internal error, envelope in illegal state"
++                << std::endl;
++    }
+     return;
+ 
+   } else if (newPhase == Phase::Attack1 || newPhase == Phase::Attack2 ||
+diff -ruN /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/pitch.h emusc/libemusc/src/pitch.h
+--- /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/pitch.h	2026-11-07 19:34:19.297491800 -0800
++++ emusc/libemusc/src/pitch.h	2026-11-07 19:49:48.024708400 -0800
+@@ -37,9 +37,10 @@
+ class Pitch : public Envelope
+ {
+ public:
++  /* portaSrc: glide source pitch (key * 1000 scale), INT32_MIN = no glide */
+   Pitch(ControlRom &ctrlRom, uint16_t instrumentIndex, int partialId,
+         uint8_t key, uint8_t velocity, WaveGenerator *LFO1, WaveGenerator *LFO2,
+-        Settings *settings, int8_t partId);
++        Settings *settings, int8_t partId, int portaSrc = INT32_MIN);
+   ~Pitch();
+ 
+   void update(void);
+@@ -53,6 +54,11 @@
+ 
+   void first_sample_run_complete(void);
+ 
++  /* PRISM: portamento state for the part's next glide */
++  inline int  porta_base(void) { return _portaMyBase; }
++  inline int  porta_now(void) { return _portaMyBase + _portamentoDelta; }
++  inline bool gliding(void) { return _portamentoDelta != 0; }
++
+ 
+ private:
+   bool _firstUpdate;
+@@ -109,17 +115,14 @@
+   Settings *_settings;
+   int8_t _partId;
+ 
+-  // Portamento pitch values are shared among all voices / instrument partials.
+-  // Portamento base pitch is reused in a round robin fashion for all available
+-  // voices, while the portamento target pitch is a global target.
+-  static int _portaTargetPitch;
+-  static std::array<int, 28> _portaBasePitch;
+-  static int _pbpIndex;
++  // PRISM: this partial's own fully corrected base pitch, and the glide
++  // source handed down from the part (INT32_MIN = no glide).
++  int _portaMyBase;
++  int _portaSrc;
+ 
+   Pitch();
+ 
+   void _init_envelope(uint8_t envelope);
+-  int _init_portamento(bool portamento, bool legato);
+ 
+   void _init_base_pitch(void);
+   void _apply_key_shifts_bp(void);
+diff -ruN /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/synth.cc emusc/libemusc/src/synth.cc
+--- /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/synth.cc	2026-11-07 19:34:19.387138500 -0800
++++ emusc/libemusc/src/synth.cc	2026-11-07 19:46:40.325518100 -0800
+@@ -39,6 +39,12 @@
+ 
+ namespace EmuSC {
+ 
++/* PRISM: host worker pool, see synth.h */
++extern "C" {
++void (*emusc_parallel_run)(void (*job)(void *, int), void *arg, int count) = 0;
++int emusc_parallel_count = 1;
++}
++
+ Synth::Synth(ControlRom &controlRom, WaveRom &waveRom, SoundMap map)
+   : _sampleRate(0),
+     _channels(0),
+@@ -48,7 +54,10 @@
+     _phase(0.0),
+     _updateCounter(0),
+     _hostSampleBufRIndex(0),
+-    _hostSampleBufWIndex(0)
++    _hostSampleBufWIndex(0),
++    _polyCap(0),
++    _steal(true),
++    _renderNext(0)
+ {
+   srand (static_cast<unsigned>(time(0)));
+ 
+@@ -56,14 +65,10 @@
+ 
+   _parts.reserve(16);
+ 
+-  if (map == SoundMap::GS) {
+-    std::cout << "libEmuSC: GS sound map initialized" << std::endl;
+-  } else if (map == SoundMap::GS_GM) {
+-    std::cout << "libEmuSC: GS (GM system) sound map initialized" << std::endl;
++  if (map == SoundMap::GS_GM) {
+     _settings->set_gm_mode();
+   } else if (map == SoundMap::MT32) {
+     _settings->set_map_mt32();
+-    std::cout << "libEmuSC: MT-32 sound map initialized" << std::endl;
+   }
+ 
+   _systemEffects = new SystemEffects(_settings);
+@@ -101,21 +106,97 @@
+ }
+ 
+ 
++/* Partials a note-on would allocate on this part: the instrument's partial
++ * mask, as the Note constructor reads it. 0 for undefined instruments. */
++int Synth::_note_partials(Part &p, uint8_t key)
++{
++  uint8_t bank = _settings->get_param(PatchParam::ToneNumber, p.id());
++  uint8_t tone = _settings->get_param(PatchParam::ToneNumber2, p.id());
++  uint16_t idx;
++  if (_settings->get_param(PatchParam::UseForRhythm, p.id()) == 0)
++    idx = _ctrlRom.variation(bank)[tone];
++  else
++    idx = _ctrlRom.drumSet(bank).preset[key];
++  if (idx == 0xffff)
++    return 0;
++  uint8_t m = _ctrlRom.instrument(idx).partialsUsed & 3;
++  return (m & 1) + ((m >> 1) & 1);
++}
++
++
++/* Steal one note. Releasing notes give way first, quietest first; otherwise
++ * the oldest sounding note goes, like the hardware's last-note priority.
++ * Returns the partials freed, 0 when there was nothing to steal. */
++int Synth::_steal_one(void)
++{
++  Part *vp = NULL;
++  Note *vn = NULL;
++  long best = 0;
++  for (auto &p : _parts) {
++    long score;
++    Note *n = p.steal_candidate(&score);
++    if (n && (!vn || score < best)) { vn = n; vp = &p; best = score; }
++  }
++  if (!vn)
++    return 0;
++  return vp->kill_note(vn);
++}
++
++
+ void Synth::_add_note(uint8_t midiChannel, uint8_t key, uint8_t velocity)
+ {
+-  int partialsUsed = 0;
++  int used = 0;
+   for (auto &p: _parts)
+-    partialsUsed += p.get_num_partials();
++    used += p.get_num_partials();
+ 
+-  // TODO: Prioritize parts / MIDI channels based on info in owners manual
+-  // FIXME: Reduce voice count when volume envelope is corrected!
+-  if (partialsUsed > _ctrlRom.max_polyphony() * 2)
+-    std::cout << "EmuSC: New note on ignored due to voice limit"
+-	      << std::endl;
+-  else
+-    for (auto &p: _parts)
+-      if (p.midi_channel() == midiChannel)
+-	p.add_note(key, velocity);
++  int cap = _polyCap > 0 ? _polyCap : _ctrlRom.max_polyphony();
++
++  for (auto &p: _parts) {
++    if (p.midi_channel() != midiChannel)
++      continue;
++
++    int need = _note_partials(p, key);
++    if (need > 0) {
++      while (used + need > cap && _steal) {
++        int freed = _steal_one();
++        if (freed <= 0)
++          break;
++        used -= freed;
++        if (used < 0) used = 0;
++      }
++      if (used + need > cap)
++        continue;                       // no room and nothing to steal
++    }
++
++    if (p.add_note(key, velocity) > 0)
++      used += need;
++  }
++}
++
++
++void Synth::set_polyphony_cap(int partials)
++{
++  if (partials < 0) partials = 0;
++  if (partials > 128) partials = 128;
++  _polyCap = partials;
++}
++
++
++void Synth::set_voice_stealing(bool on) { _steal = on; }
++
++
++int Synth::get_polyphony_cap(void)
++{
++  return _polyCap > 0 ? _polyCap : _ctrlRom.max_polyphony();
++}
++
++
++int Synth::get_num_partials(void)
++{
++  int used = 0;
++  for (auto &p: _parts)
++    used += p.get_num_partials();
++  return used;
+ }
+ 
+ /* Not used -> WaveRom as part of sample dump to disk
+@@ -232,7 +313,6 @@
+       break;
+ 
+     default:
+-      std::cout << "EmuSC MIDI: Unknown event received" << std::endl;
+       break;
+     }
+ 
+@@ -270,17 +350,8 @@
+     return;
+   }
+ 
+-  if (1) {
+-    std::cout << "libEmuSC: Valid SysEx  message received: ";
+-    for (int i = 0; i < length; i ++)
+-      std::cout << std::hex << (int) data[i] << " " << std::flush;
+-    std::cout << std::endl;
+-  }
+-
+-  if (data[4] == 0x11) {
+-    std::cerr << "SysEx responses are not implemented yet" << std::endl;
++  if (data[4] == 0x11)      // Requests (RQ1) would need a reply channel
+     return;
+-  }
+ 
+   midiMutex.lock();
+ 
+@@ -336,6 +407,20 @@
+ }
+ 
+ 
++/* PRISM: render workers claim parts off a shared counter. */
++void Synth::_render_job(void *arg, int k)
++{
++  Synth *s = (Synth *) arg;
++  (void) k;
++  for (;;) {
++    int i = __sync_fetch_and_add(&s->_renderNext, 1);
++    if (i >= (int) s->_parts.size())
++      break;
++    s->_parts[i].render_block();
++  }
++}
++
++
+ // Do a control update and read 256 samples
+ void Synth::_process_samples(void)
+ {
+@@ -358,9 +443,29 @@
+ 
+   _hostSampleBufWIndex = 0;
+ 
+-  // Iterate all parts and ask for next sample
++  /* Each part renders into its own buffers (on the host's workers when it
++   * provides them), then the buses are summed with that part's own sends.
++   * This also keeps one part's send levels off the other parts' audio. */
++  if (emusc_parallel_run && emusc_parallel_count > 1) {
++    _renderNext = 0;
++    emusc_parallel_run(&Synth::_render_job, this, emusc_parallel_count);
++  } else {
++    for (auto &p : _parts)
++      p.render_block();
++  }
++
+   for (auto &p : _parts) {
+-    p.get_sample_set(_dryBus, _chorusBus, _reverbBus);
++    if (!p.bus_active())
++      continue;
++    const std::array<std::array<float, 256>, 2> &bus = p.dry_bus();
++    float cs = p.chorus_send(), rs = p.reverb_send();
++    for (int c = 0; c < 2; c++)
++      for (int i = 0; i < 256; i++) {
++        float v = bus[c][i];
++        _dryBus[c][i] += v;
++        _chorusBus[c][i] += v * cs;
++        _reverbBus[c][i] += v * rs;
++      }
+   }
+ 
+   // Add system effects
+diff -ruN /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/synth.h emusc/libemusc/src/synth.h
+--- /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/synth.h	2026-11-07 19:34:19.397243300 -0800
++++ emusc/libemusc/src/synth.h	2026-11-07 19:45:48.838069700 -0800
+@@ -59,6 +59,14 @@
+ class Part;
+ class Settings;
+ 
++/* PRISM: optional host-supplied worker pool. When set, part rendering is dealt
++ * across the host's threads: job(arg, k) is called for k in [0, count) and the
++ * call returns when every job is done. The host owns the threads. */
++extern "C" {
++extern void (*emusc_parallel_run)(void (*job)(void *, int), void *arg, int count);
++extern int emusc_parallel_count;
++}
++
+ class Synth
+ {
+ public:
+@@ -81,6 +89,15 @@
+   uint32_t get_num_clipped_samples(bool reset = true);
+   std::array<int, 16> get_parts_last_peak_sample(void);
+ 
++  /* PRISM: voice management. The cap counts partials, like the hardware
++   * (24 on an SC-55, 28 on a mkII); 0 restores the model's own limit. With
++   * stealing on, the oldest or quietest releasing note gives way instead of
++   * the new note being dropped. */
++  void set_polyphony_cap(int partials);
++  void set_voice_stealing(bool on);
++  int  get_polyphony_cap(void);
++  int  get_num_partials(void);          // partials sounding right now
++
+   // Setting audio properties (default is 44100, 2)
+   void set_audio_format(uint32_t sampleRate, uint8_t channels);
+ 
+@@ -182,9 +199,16 @@
+   static const uint8_t midi_ChPressure      = 0xd0;
+   static const uint8_t midi_PitchBend       = 0xe0;
+ 
++  int _polyCap;                 // 0 = the model's own limit
++  bool _steal;
++  volatile int _renderNext;     // next part index claimed by a render worker
++
+   void _init_parts(void);
+ // int _export_sample_24(std::vector<int32_t> &sampleSet, std::string filename);
+   void _add_note(uint8_t midiChannel, uint8_t key, uint8_t velocity);
++  int _note_partials(Part &p, uint8_t key);   // partials a new note would take
++  int _steal_one(void);                       // kill a victim, return its partials
++  static void _render_job(void *arg, int k);
+ 
+   void _midi_input_sysex_DT1(uint8_t model, uint8_t *data, uint16_t length);
+ 
+diff -ruN /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/tva.cc emusc/libemusc/src/tva.cc
+--- /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/tva.cc	2026-11-07 19:34:19.424124100 -0800
++++ emusc/libemusc/src/tva.cc	2026-11-07 20:28:02.518828800 -0800
+@@ -34,17 +34,25 @@
+          int8_t partId, uint16_t instrumentIndex, int partialId)
+   : Envelope(ctrlRom.lookupTables),
+     _initRunComplete(false),
++    _dynLevel(0),
++    _dynLevelMode(0),
+     _prevDynLevel(0),
+     _envLevel(0),
++    _envLevelMode(0),
++    _prevEnvLevel(0),
+     _LFO1(LFO1),
+     _LFO2(LFO2),
+     _lfo1FadeComplete(false),
+     _lfo2FadeComplete(false),
++    _lfo1Depth(0),
++    _lfo2Depth(0),
+     _LUT(ctrlRom.lookupTables),
+     _instPartial(ctrlRom.instrument(instrumentIndex).partials[partialId]),
+     _key(key),
+     _drumSet(settings->get_param(PatchParam::UseForRhythm, partId)),
+     _panpot(-1),
++    _panpotL(0),
++    _panpotR(0),
+     _panpotLocked(false),
+     _settings(settings),
+     _partId(partId),
+@@ -297,8 +305,12 @@
+   _prevEnvLevel = _envLevel;
+ 
+   if (_phase == Phase::Terminated) {
+-    std::cerr << "libEmuSC: Internal error, envelope used in Terminated phase"
+-	      << std::endl;
++    static bool warned = false;
++    if (!warned) {
++      warned = true;
++      std::cerr << "libEmuSC: Internal error, envelope used in Terminated phase"
++                << std::endl;
++    }
+     return;
+ 
+   } else if (_phase == Phase::Sustain) {
+diff -ruN /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/tvf.cc emusc/libemusc/src/tvf.cc
+--- /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/tvf.cc	2026-11-07 19:34:19.445258700 -0800
++++ emusc/libemusc/src/tvf.cc	2026-11-07 20:25:16.397701000 -0800
+@@ -60,11 +60,31 @@
+     _LFO2(LFO2),
+     _lfo1FadeComplete(false),
+     _lfo2FadeComplete(false),
++    _lfo1Depth(0),
++    _lfo2Depth(0),
+     _LUT(LUT),
+     _instPartial(instPartial),
++    _L1Init(0),
++    _L2Init(0),
++    _L3Init(0),
++    _L4Init(0),
++    _L5Init(0),
++    _ipLevelInit(0),
++    _currentEnvTime(0),
++    _currentLevelInit(0),
++    _prevLevelInit(0),
++    _coFreqIndex(0),
++    _resIndexFreq(0),
++    _resIndexUsed(0),
+     _resonance(0x40),
++    _envDepth(0),
+     _envLevel(0),
++    _envLevelMode(0),
++    _prevEnvLevel(0),
+     _key(key),
++    _velocity(0),
++    _coFreqVSens(0),
++    _keyFollow(0),
+     _settings(settings),
+     _partId(partId)
+ {
+@@ -532,8 +552,12 @@
+ void TVF::_init_new_phase(enum Phase newPhase)
+ {
+   if (newPhase == Phase::Terminated) {
+-    std::cerr << "libEmuSC: Internal error, envelope in illegal state"
+-	      << std::endl;
++    static bool warned = false;
++    if (!warned) {
++      warned = true;
++      std::cerr << "libEmuSC: Internal error, envelope in illegal state"
++                << std::endl;
++    }
+     return;
+ 
+   } else if (newPhase == Phase::Attack1) {
+diff -ruN /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/wave_generator.cc emusc/libemusc/src/wave_generator.cc
+--- /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/wave_generator.cc	2026-11-07 19:34:19.468530300 -0800
++++ emusc/libemusc/src/wave_generator.cc	2026-11-07 19:53:39.660493300 -0800
+@@ -184,8 +184,15 @@
+     case Waveform::SampleHold: LFOValue = _generate_sample_hold(rate); break;
+     case Waveform::Random:     LFOValue = _generate_random(rate);      break;
+     default:
+-      std::cerr << "libEmuSC: Internal error! Waveform generator called with "
+-                << "illegal waveform ID: " << (int) _waveform << std::endl;
++      {
++        static bool warned = false;
++        if (!warned) {
++          warned = true;
++          std::cerr << "libEmuSC: Internal error! Waveform generator called "
++                    << "with illegal waveform ID: " << (int) _waveform
++                    << std::endl;
++        }
++      }
+       return;
+   }
+ 
+diff -ruN /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/wave_oscillator.cc emusc/libemusc/src/wave_oscillator.cc
+--- /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/wave_oscillator.cc	2026-11-07 19:34:19.490007200 -0800
++++ emusc/libemusc/src/wave_oscillator.cc	2026-11-07 19:50:55.756387500 -0800
+@@ -28,18 +28,18 @@
+ 
+ WaveOscillator::WaveOscillator(ControlRom::Sample *ctrlSample,
+                                std::vector<float> *pcmSamples,
+-                               std::function<void(void)> cb)
++                               std::function<void(void)> cb, bool portamento)
+   : _pcmSamples(pcmSamples),
+     _phase(0.0f),
+     _loopMode{ctrlSample->loopMode},
+     _firstRunCompleteCallback(cb),
+     _firstRunComplete(false)
+ {
+-  // TODO: Add check if note is portamento / legato to skip attack phase
+-//  if (!portamento)
++  // A gliding (portamento / legato) note skips the attack transient and
++  // starts at the offset stored with the sample control data
+   _sampleStart = 0;
+-//  else
+-//    sampleStart = ctrlSample->portaOffset;
++  if (portamento && ctrlSample->portaOffset < ctrlSample->sampleLen)
++    _sampleStart = ctrlSample->portaOffset;
+ 
+   _sampleEnd = ctrlSample->sampleLen;
+   _loopStart = _sampleEnd - ctrlSample->loopLen;
+@@ -50,6 +50,9 @@
+     _loopStart = _sampleEnd - 2 * ctrlSample->loopLen - 1;
+   }
+ 
++  if (_loopStart < 0)
++    _loopStart = 0;
++
+   _index = _sampleStart;
+ }
+ 
+@@ -57,59 +60,46 @@
+ void WaveOscillator::get_sample_set(Pitch *pitch, float pitchBend,
+                                     std::array<float, 256> &dryBus)
+ {
+-  for (int i = 0; i < 256; i++) {
+-    float output = _interpolate();
+-    dryBus[i] = output;
++  /* Reads stay within the decoded sample set by construction: indexes wrap
++   * to _loopStart before they pass _sampleEnd, which is the last entry. */
++  const float *smp = _pcmSamples->data();
++  const int end = _sampleEnd, loop = _loopStart;
++  int idx = _index;
++  float phase = _phase;
+ 
+-    _phase += pitchBend * pitch->get_phase_increment() / 16384.0f;
+-    while (_phase >= 1.0f) {
+-      _phase -= 1.0f;
++  for (int i = 0; i < 256; i++) {
++    // Interpolation based on information from the Nuked-SC55 project:
++    // the hardware uses the top 7 bits of the fractional phase
++    int i1 = idx + 1 > end ? loop : idx + 1;
++    int i2 = i1 + 1 > end ? loop : i1 + 1;
++    int i3 = i2 + 1 > end ? loop : i2 + 1;
++    float s0 = smp[idx], s1 = smp[i1], s2 = smp[i2], s3 = smp[i3];
++
++    int r = static_cast<int>(phase * 128.0f) & 127;
++    constexpr float q = 1.0f / 4096.0f;
++    float c0 = _interpolationLUT[0][r] * q;
++    float c1 = _interpolationLUT[1][r] * q;
++    float c2 = _interpolationLUT[2][r] * q;
++
++    dryBus[i] = s0 + c0 * (s1 - s0) + c1 * (s2 - s1) + c2 * (s3 - s2);
++
++    phase += pitchBend * pitch->get_phase_increment() / 16384.0f;
++    while (phase >= 1.0f) {
++      phase -= 1.0f;
+ 
+-      if (!_firstRunComplete && _index >= _sampleEnd) {
++      if (!_firstRunComplete && idx >= end) {
+         _firstRunComplete = true;
+         if (_firstRunCompleteCallback) _firstRunCompleteCallback();
+       }
+ 
+-      _index++;
+-      if (_index > _sampleEnd)
+-	_index = _loopStart;
++      idx++;
++      if (idx > end)
++	idx = loop;
+     }
+   }
+-}
+-
+-
+-float WaveOscillator::_fetch_sample(int index)
+-{
+-  index = std::clamp(index, 0, (int) _pcmSamples->size() - 1);
+-  return _pcmSamples->at(index);
+-}
+-
+-
+-// Interpolation algorithm is based on information from the Nuked-SC55 project
+-// by nukeykt
+-float WaveOscillator::_interpolate()
+-{
+-  int i = _index;
+-  auto step = [&]() {
+-    i++;
+-    if (i > _sampleEnd)
+-      i = _loopStart;
+-  };
+-
+-  float s0 = _fetch_sample(i);  step();
+-  float s1 = _fetch_sample(i);  step();
+-  float s2 = _fetch_sample(i);  step();
+-  float s3 = _fetch_sample(i);
+-
+-  // Hardware uses only the top 7 bits of the fractional phase.
+-  int r = static_cast<int>(_phase * 128.0f) & 127;
+-
+-  constexpr float q = 1.0f / 4096.0f;
+-  float c0 = _interpolationLUT[0][r] * q;
+-  float c1 = _interpolationLUT[1][r] * q;
+-  float c2 = _interpolationLUT[2][r] * q;
+ 
+-  return s0 + c0 * (s1 - s0) + c1 * (s2 - s1) + c2 * (s3 - s2);
++  _index = idx;
++  _phase = phase;
+ }
+ 
+ 
+diff -ruN /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/wave_oscillator.h emusc/libemusc/src/wave_oscillator.h
+--- /mnt/c/Users/eggst/AppData/Local/Temp/claude/989ccee31314b240/aef50343-f7be-4fcd-a688-63d78ec4add3/scratchpad/emusc-clone/libemusc/src/wave_oscillator.h	2026-11-07 19:34:19.503284500 -0800
++++ emusc/libemusc/src/wave_oscillator.h	2026-11-07 19:51:01.619830900 -0800
+@@ -50,7 +50,7 @@
+ {
+ public:
+   WaveOscillator(ControlRom::Sample *ctrlSample, std::vector<float> *pcmSamples,
+-                 std::function<void(void)> cb);
++                 std::function<void(void)> cb, bool portamento = false);
+ 
+   void get_sample_set(Pitch *pitch, float pitchBend,
+                       std::array<float, 256> &dryBus);
+@@ -77,9 +77,6 @@
+   std::function<void(void)> _firstRunCompleteCallback = NULL;
+   bool _firstRunComplete;
+ 
+-  float _fetch_sample(int index);
+-  float _interpolate();
+-
+   // Lookup table from the Nuked-SC55 project by nukeykt
+   static constexpr uint16_t _interpolationLUT[3][128] = {
+     // c0 (cumulative weight of delta0)

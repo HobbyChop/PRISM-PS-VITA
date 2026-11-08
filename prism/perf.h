@@ -13,9 +13,12 @@
 #define PERF_BUILTIN_PATH "app0:/sf/GeneralUser-GS.sf2"
 
 /* Module settings, saved with a performance since PRF4. valid = 0 in older
- * files, which leave the module settings unchanged. */
+ * files, which leave the module settings unchanged. mode: 0 GM, 1 MT-32,
+ * 2 SC-55. The SC-55 fields live in the block's former spare bytes, so
+ * sc_valid = 0 in files saved before SC-55 mode existed. */
 typedef struct {
     uint8_t valid, mode, reverb, gain, analog, src, render, partials, cores, map;
+    uint8_t sc_valid, sc_map, sc_poly, sc_steal, sc_gain, sc_cores;
 } PerfModule;
 
 typedef struct {
@@ -45,7 +48,8 @@ const char *perf_bank_label(const Perf *p, char *out, int n);   /* bank name for
 int  perf_exists_index(int idx);
 const char *perf_name_index(int idx);
 int  perf_load_index(int idx, Perf *out);   /* 0 = ok */
-/* engine requested by the last applied performance: -1 none, 0 GM, 1 MT-32 */
+/* engine requested by the last applied performance:
+ * -1 none, 0 GM, 1 MT-32, 2 SC-55 */
 int  perf_wanted_mode(void);
 
 #endif

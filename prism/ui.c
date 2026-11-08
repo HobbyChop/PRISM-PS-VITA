@@ -4,6 +4,7 @@
 #include "cfg.h"
 #include "fx.h"
 #include "mt32.h"
+#include "sc55.h"
 #include <psp2/ctrl.h>
 #include <stdio.h>
 #include <string.h>
@@ -26,8 +27,8 @@ Fonts g_fonts;
 #define C_AMBER  0xF0B35B
 #define C_RED    0xE0574F
 
-enum { PG_PLAY = 0, PG_PERFORM, PG_MIX, PG_FX, PG_MT32, PG_SETUP, PG_COUNT };
-static const char *PG_LABEL[PG_COUNT] = { "PLAY", "PERFORM", "MIX", "EFFECTS", "MT-32", "SETUP" };
+enum { PG_PLAY = 0, PG_PERFORM, PG_MIX, PG_FX, PG_MT32, PG_SC55, PG_SETUP, PG_COUNT };
+static const char *PG_LABEL[PG_COUNT] = { "PLAY", "PERFORM", "MIX", "EFFECTS", "MT-32", "SC-55", "SETUP" };
 static const char *GM_FAMILY[16] = { "PIANO", "CHROMATIC", "ORGAN", "GUITAR", "BASS", "STRINGS", "ENSEMBLE", "BRASS",
                                      "REED", "PIPE", "SYNTH LEAD", "SYNTH PAD", "SYNTH FX", "ETHNIC", "PERCUSSIVE", "SOUND FX" };
 
@@ -74,6 +75,11 @@ enum { MR_MODE = 0, MR_REVERB, MR_GAIN, MR_MAP, MR_RESCAN, MR_ANALOG, MR_SRC, MR
 #define MR_MODULE_ROWS 5
 static int s_mt_row = 0;
 static const char *ANALOG_NAME[4] = { "DIGITAL ONLY", "COARSE", "ACCURATE", "OVERSAMPLED" };
+/* SC-55 page: four rows in the MODULE card, three in the EMULATION card */
+enum { SCR_MODE = 0, SCR_SOUNDMAP, SCR_GAIN, SCR_RESCAN, SCR_POLY, SCR_STEAL, SCR_CORES, SCR_COUNT };
+#define SCR_MODULE_ROWS 4
+static int s_sc_row = 0;
+static const char *SOUNDMAP_NAME[3] = { "GS", "GM SYSTEM", "MT-32 MAP" };
 static int fx_get(int k)
 {
     switch (k) {
@@ -282,11 +288,11 @@ static void topbar(const UiStatus *st, const char *sub)
     const char *bank = g_syn_bank_name[0] ? g_syn_bank_name : "NO BANK";
     char bn[40]; snprintf(bn, sizeof bn, "%.30s", bank);
     char *dot = strrchr(bn, '.'); if (dot) *dot = 0;
-    const char *mode = g_syn_mode == 1 ? "MT-32" : "GM";
-    const char *what = g_syn_mode == 1 ? g_mt32.ctrl_desc : bn;
+    const char *mode = g_syn_mode == 1 ? "MT-32" : g_syn_mode == 2 ? "SC-55" : "GM";
+    const char *what = g_syn_mode == 1 ? g_mt32.ctrl_desc : g_syn_mode == 2 ? g_sc55.status : bn;
     char wn[34]; snprintf(wn, sizeof wn, "%.30s", what);
     int pw = text_w(g_fonts.mo11, mode, 0) + 10 + text_w(g_fonts.mo11, wn, 0) + 24;
-    gfx_frame(xr - pw, 11, pw, 22, 11, g_syn_mode == 1 ? C_MINT : C_LINE, 255);
+    gfx_frame(xr - pw, 11, pw, 22, 11, g_syn_mode != 0 ? C_MINT : C_LINE, 255);
     gfx_text(g_fonts.mo11, xr - pw + 12, 16, mode, C_TEXT, 255, 0);
     gfx_text(g_fonts.mo11, xr - pw + 12 + text_w(g_fonts.mo11, mode, 0) + 10, 16, wn, C_GREY, 255, 0);
 }
@@ -411,6 +417,48 @@ static void mt_browse_move(int d)
     mt_set(s_part, MP_PATCH, s_browse_cur);
 }
 
+/* ---- PLAY in SC-55 mode: the sixteen GS parts ---- */
+/* Each part's instrument, variation bank, channel, level, pan and sends are
+ * edited through the emulator's own parameter memory, like the front panel
+ * of the real module. */
+enum { SP_INST = 0, SP_BANK, SP_CH, SP_LEVEL, SP_PAN, SP_REV, SP_CHO, SP_COUNT };
+static int sc_get(int part, int r)
+{
+    switch (r) {
+    case SP_INST: return g_sc55.prog[part];
+    case SP_BANK: return g_sc55.bank[part];
+    case SP_CH: return g_sc55.chan[part] > 16 ? 16 : g_sc55.chan[part];
+    case SP_LEVEL: return g_sc55.level[part];
+    case SP_PAN: return g_sc55.pan[part];
+    case SP_REV: return g_sc55.rev[part];
+    default: return g_sc55.cho[part];
+    }
+}
+static void sc_set(int part, int r, int v)
+{
+    static const int EV[SP_COUNT] = { SEV_SC_PROG, SEV_SC_BANK, SEV_SC_CH, SEV_SC_LEVEL, SEV_SC_PAN, SEV_SC_REV, SEV_SC_CHO };
+    int mx = r == SP_CH ? 16 : 127;
+    if (r == SP_BANK && g_sc55.drum[part]) return;   /* drum parts have no variations */
+    if (v < 0) v = 0;
+    if (v > mx) v = mx;
+    syn_event(EV[r], part, v, 0);
+    /* mirror at once so held edits step from the new value */
+    switch (r) {
+    case SP_INST: g_sc55.prog[part] = (unsigned char)v; break;
+    case SP_BANK: g_sc55.bank[part] = (unsigned char)v; break;
+    case SP_CH: g_sc55.chan[part] = (unsigned char)v; break;
+    case SP_LEVEL: g_sc55.level[part] = (unsigned char)v; break;
+    case SP_PAN: g_sc55.pan[part] = (unsigned char)v; break;
+    case SP_REV: g_sc55.rev[part] = (unsigned char)v; break;
+    default: g_sc55.cho[part] = (unsigned char)v; break;
+    }
+}
+static void sc_browse_move(int d)
+{
+    s_browse_cur = (s_browse_cur + 128 + d) % 128;
+    sc_set(s_part, SP_INST, s_browse_cur);
+}
+
 static void draw_play_mt32(const UiStatus *st)
 {
     char b[64];
@@ -491,9 +539,97 @@ static void draw_play_mt32(const UiStatus *st)
              : "UP DOWN SETTING   O + LEFT RIGHT VALUE   LEFT BACK TO PARTS   TRIANGLE LIST   X AUDITION", C_GREY, 255, 0);
 }
 
+static void draw_play_sc55(const UiStatus *st)
+{
+    char b[64];
+    /* rail: the sixteen GS parts */
+    gfx_text(g_fonts.s11, RAIL_X + 10, RAIL_Y - 16, "SC-55 PARTS", C_GREY, 255, 2);
+    gfx_text_right(g_fonts.mo10, RAIL_X + RAIL_W - 10, RAIL_Y - 15, "CH   LVL", C_GREY, 255, 0);
+    for (int i = 0; i < 16; i++) {
+        int y = RAIL_Y + i * ROW_H;
+        int sel = i == s_part, off = g_sc55.chan[i] >= 16, drum = g_sc55.drum[i];
+        if (sel) { gfx_round(RAIL_X, y, RAIL_W, ROW_H - 1, 6, C_PANEL2, 255); gfx_fill(RAIL_X, y + 4, 2, ROW_H - 9, s_focus == 0 ? C_MINT : C_LINE, 255); }
+        snprintf(b, sizeof b, "%02d", i + 1);
+        gfx_text(g_fonts.mo11, RAIL_X + 12, y + 6, b, drum ? C_AMBER : C_GREY, 255, 0);
+        gfx_text_fit(g_fonts.s13, RAIL_X + 40, y + 4, 130, g_sc55.pname[i][0] ? g_sc55.pname[i] : "-", off ? C_GREY : sel ? C_TEXT : C_TEXT2, 255);
+        if (off) snprintf(b, sizeof b, "OFF"); else snprintf(b, sizeof b, "%d", g_sc55.chan[i] + 1);
+        gfx_text_right(g_fonts.mo10, RAIL_X + RAIL_W - 62, y + 7, b, off ? C_AMBER : C_GREY, 255, 0);
+        gfx_fill(RAIL_X + RAIL_W - 54, y + 11, 44, 3, C_LINE, 255);
+        gfx_fill(RAIL_X + RAIL_W - 54, y + 11, 44 * g_sc55.bars[i] / 16, 3, g_sc55.bars[i] ? C_MINT : C_LINE, 255);
+    }
+
+    /* patch card */
+    int cx = CARD_X, cy = RAIL_Y - 14;
+    if (g_sc55.drum[s_part]) snprintf(b, sizeof b, "SC-55  -  PART %d  -  DRUM SET %03d", s_part + 1, g_sc55.prog[s_part] + 1);
+    else snprintf(b, sizeof b, "SC-55  -  PART %d  -  BANK %03d  -  PC %03d", s_part + 1, g_sc55.bank[s_part], g_sc55.prog[s_part] + 1);
+    gfx_text(g_fonts.mo11, cx, cy, b, C_GREY, 255, 1);
+    gfx_text_fit(g_fonts.b34, cx, cy + 18, CARD_W - 70, g_sc55.pname[s_part][0] ? g_sc55.pname[s_part] : "-", C_TEXT, 255);
+    gfx_round(cx + CARD_W - 62, cy + 22, 28, 28, 6, C_PANEL2, 255);
+    gfx_text_center(g_fonts.b17, cx + CARD_W - 48, cy + 27, "<", C_TEXT, 255, 0);
+    gfx_round(cx + CARD_W - 30, cy + 22, 28, 28, 6, C_PANEL2, 255);
+    gfx_text_center(g_fonts.b17, cx + CARD_W - 16, cy + 27, ">", C_TEXT, 255, 0);
+    /* settings */
+    int ly = cy + 72, vx = cx + 124, sw = CARD_W - 124 - 54;
+    gfx_fill(cx, ly - 12, CARD_W, 1, C_LINE, 255);
+    static const char *LBL[SP_COUNT] = { "INSTRUMENT", "VARIATION", "CHANNEL", "LEVEL", "PAN", "REVERB", "CHORUS" };
+    for (int r = 0; r < SP_COUNT; r++) {
+        int y = ly + r * 22, sel = s_focus == 1 && r == s_row;
+        if (sel) gfx_round(cx - 8, y - 3, CARD_W + 16, 22, 5, C_PANEL2, 255);
+        gfx_text(g_fonts.s11, cx, y + 3, LBL[r], sel ? C_TEXT : C_GREY, 255, 2);
+        int v = sc_get(s_part, r);
+        if (r == SP_INST) {
+            snprintf(b, sizeof b, "%03d", v + 1);
+            gfx_text(g_fonts.mo11, vx, y + 2, b, C_MINT2, 255, 0);
+            gfx_text(g_fonts.mo10, vx + 40, y + 3, g_sc55.drum[s_part] ? "DRUM SET  -  TRIANGLE LISTS THEM" : "CAPITAL TONE  -  TRIANGLE LISTS THEM", C_GREY, 255, 0);
+        } else if (r == SP_BANK) {
+            if (g_sc55.drum[s_part]) gfx_text(g_fonts.mo11, vx, y + 2, "-", C_GREY, 255, 0);
+            else {
+                snprintf(b, sizeof b, "%03d", v);
+                gfx_text(g_fonts.mo11, vx, y + 2, b, v ? C_MINT2 : C_TEXT, 255, 0);
+                gfx_text(g_fonts.mo10, vx + 40, y + 3, v ? "GS VARIATION  CC 0" : "CAPITAL  -  CC 0 PICKS A VARIATION", C_GREY, 255, 0);
+            }
+        } else if (r == SP_CH) {
+            if (v >= 16) snprintf(b, sizeof b, "OFF"); else snprintf(b, sizeof b, "%d", v + 1);
+            gfx_text(g_fonts.mo11, vx, y + 2, b, v >= 16 ? C_AMBER : C_MINT2, 255, 0);
+            gfx_text(g_fonts.mo10, vx + 40, y + 3, v >= 16 ? "RECEIVES NOTHING" : "RECEIVES THIS CHANNEL", C_GREY, 255, 0);
+        } else {
+            int fx = vx + (sw - 8) * v / 127;
+            gfx_fill(vx, y + 7, sw, 3, C_LINE, 255);
+            gfx_fill(vx, y + 7, fx - vx + 4, 3, C_MINT, 255);
+            gfx_disc(fx + 4, y + 8, 4, sel ? C_MINT2 : C_TEXT, 255);
+            if (r == SP_PAN) { if (v == 64) snprintf(b, sizeof b, "C"); else if (v < 64) snprintf(b, sizeof b, "L%d", 64 - v); else snprintf(b, sizeof b, "R%d", v - 64); }
+            else snprintf(b, sizeof b, "%d", v);
+            gfx_text_right(g_fonts.mo11, cx + CARD_W, y + 2, b, C_TEXT, 255, 0);
+        }
+    }
+
+    /* right column: module and engine */
+    card(RIGHT_X, RAIL_Y - 14, 212, 150);
+    gfx_text(g_fonts.s11, RIGHT_X + 12, RAIL_Y - 2, "SOUND CANVAS", C_GREY, 255, 2);
+    /* the classic bar display: sixteen columns of sixteen segments */
+    gfx_round(RIGHT_X + 12, RAIL_Y + 14, 188, 56, 6, C_DEEP, 255);
+    for (int p = 0; p < 16; p++) {
+        int bx = RIGHT_X + 18 + p * 11;
+        for (int s2 = 0; s2 < 8; s2++) {
+            int lit = g_sc55.bars[p] > s2 * 2;
+            gfx_fill(bx, RAIL_Y + 60 - s2 * 6, 8, 4, lit ? C_MINT : C_PANEL2, 255);
+        }
+    }
+    snprintf(b, sizeof b, "%d of %d voices", g_sc55.voices, g_sc55.polycap);
+    gfx_text(g_fonts.mo10, RIGHT_X + 12, RAIL_Y + 78, b, C_GREY, 255, 0);
+    gfx_text_fit(g_fonts.mo10, RIGHT_X + 12, RAIL_Y + 94, 188, g_sc55.status, C_GREY, 255);
+    snprintf(b, sizeof b, "%s  -  gain %d", SOUNDMAP_NAME[g_sc55.soundmap > 2 ? 0 : g_sc55.soundmap], g_sc55.gain);
+    gfx_text(g_fonts.s12, RIGHT_X + 12, RAIL_Y + 110, b, C_TEXT2, 255, 0);
+    draw_engine_card(st);
+    gfx_text(g_fonts.mo10, CARD_X, SCR_H - 58, s_focus == 0
+             ? "UP DOWN PART   O + LEFT RIGHT TONE   RIGHT SETTINGS   TRIANGLE LIST   X AUDITION"
+             : "UP DOWN SETTING   O + LEFT RIGHT VALUE   LEFT BACK TO PARTS   TRIANGLE LIST   X AUDITION", C_GREY, 255, 0);
+}
+
 static void draw_play(const UiStatus *st)
 {
     if (g_syn_mode == 1 && mt32_is_open()) { draw_play_mt32(st); return; }
+    if (g_syn_mode == 2 && sc55_is_open()) { draw_play_sc55(st); return; }
     (void)st;
     /* part rail */
     gfx_text(g_fonts.s11, RAIL_X + 10, RAIL_Y - 16, "PARTS", C_GREY, 255, 2);
@@ -648,6 +784,30 @@ static void draw_browser_mt32(void)
     gfx_text(g_fonts.mo10, BR_X + 16, BR_Y + h - 16, "UP DOWN OR DRAG   PLAYS AS YOU GO   O CLOSE", C_GREY, 255, 0);
 }
 
+static void draw_browser_sc55(void)
+{
+    int h = BR_ROWS * BR_ROW_H + 52, drum = g_sc55.drum[s_part];
+    gfx_round(BR_X, BR_Y, BR_W, h, 10, C_DEEP, 250);
+    gfx_frame(BR_X, BR_Y, BR_W, h, 10, C_LINE, 255);
+    char b[48];
+    snprintf(b, sizeof b, "%s  PART %02d", drum ? "DRUM SETS" : "CAPITAL TONES", s_part + 1);
+    gfx_text(g_fonts.s11, BR_X + 16, BR_Y + 12, b, C_GREY, 255, 2);
+    snprintf(b, sizeof b, "FROM THE %s ROM", g_sc55.model);
+    gfx_text_right(g_fonts.mo10, BR_X + BR_W - 16, BR_Y + 13, b, C_GREY, 255, 0);
+    int first = s_browse_cur - BR_ROWS / 2;
+    if (first > 128 - BR_ROWS) first = 128 - BR_ROWS;
+    if (first < 0) first = 0;
+    for (int r = 0; r < BR_ROWS && first + r < 128; r++) {
+        int i = first + r, y = BR_Y + 34 + r * BR_ROW_H, cur = i == s_browse_cur;
+        const char *n = drum ? g_sc55.dname[i] : g_sc55.iname[i];
+        if (cur) { gfx_round(BR_X + 8, y - 1, BR_W - 16, BR_ROW_H, 4, C_PANEL2, 255); gfx_fill(BR_X + 8, y + 2, 2, BR_ROW_H - 6, C_MINT, 255); }
+        snprintf(b, sizeof b, "%03d", i + 1);
+        gfx_text(g_fonts.mo10, BR_X + 18, y + 2, b, C_GREY, 255, 0);
+        gfx_text_fit(g_fonts.s12, BR_X + 78, y, BR_W - 100, n[0] ? n : "-", n[0] ? (cur ? C_TEXT : C_TEXT2) : C_GREY, 255);
+    }
+    gfx_text(g_fonts.mo10, BR_X + 16, BR_Y + h - 16, "UP DOWN OR DRAG   PLAYS AS YOU GO   O CLOSE", C_GREY, 255, 0);
+}
+
 /* ---- MIX -------------------------------------------------------------------- */
 #define MIX_X 16
 #define MIX_Y 58
@@ -793,7 +953,7 @@ static void draw_setup(const UiStatus *st)
     gfx_text(g_fonts.mo10, mx + 16, SU_LIST_Y + 232, b, C_GREY, 255, 0);
     snprintf(b, sizeof b, "bank in memory: %.40s", g_syn_bank_name[0] ? g_syn_bank_name : "none");
     gfx_text(g_fonts.mo10, mx + 16, SU_LIST_Y + 248, b, C_GREY, 255, 0);
-    gfx_text(g_fonts.mo10, mx + 16, SU_LIST_Y + 264, "TinySoundFont MIT   Munt LGPL   GeneralUser GS", C_GREY, 255, 0);
+    gfx_text(g_fonts.mo10, mx + 16, SU_LIST_Y + 264, "TinySoundFont MIT   Munt LGPL   EmuSC LGPL   GeneralUser GS", C_GREY, 255, 0);
 }
 
 /* ---- PERFORM ---------------------------------------------------------------- */
@@ -940,7 +1100,12 @@ static void draw_fx(const UiStatus *st)
     }
     card(644, 216, 300, 110);
     gfx_text(g_fonts.s11, 660, 228, "SIGNAL PATH", C_GREY, 255, 2);
-    if (g_syn_mode == 1 && mt32_is_open()) {
+    if (g_syn_mode == 2 && sc55_is_open()) {
+        gfx_text(g_fonts.s12, 660, 250, "SC-55 mode: the emulator's output", C_TEXT2, 255, 0);
+        gfx_text(g_fonts.s12, 660, 266, "through the EQ and the limiter.", C_TEXT2, 255, 0);
+        gfx_text(g_fonts.s12, 660, 282, "Its own reverb and chorus run in", C_TEXT2, 255, 0);
+        gfx_text(g_fonts.s12, 660, 298, "the module; CC 91 and 93 set sends.", C_TEXT2, 255, 0);
+    } else if (g_syn_mode == 1 && mt32_is_open()) {
         gfx_text(g_fonts.s12, 660, 250, "MT-32 mode: the emulator's output", C_TEXT2, 255, 0);
         gfx_text(g_fonts.s12, 660, 266, "through the EQ and the limiter.", C_TEXT2, 255, 0);
         gfx_text(g_fonts.s12, 660, 282, "Its reverb is on the MT-32 page;", C_TEXT2, 255, 0);
@@ -965,8 +1130,10 @@ static void perf_after_apply(void)
         if (want < 0 && was_mt32 && mt32_is_open()) syn_event(SEV_MODE, 0, 1, 0);
     }
     if (want == 1 && mt32_is_open() && g_syn_mode != 1) syn_event(SEV_MODE, 0, 1, 0);
+    if (want == 2 && sc55_is_open() && g_syn_mode != 2) syn_event(SEV_MODE, 0, 2, 0);
     if (want == 0 && g_syn_mode != 0) syn_event(SEV_MODE, 0, 0, 0);
     if (want == 1 && !mt32_is_open()) toast("STATE WANTS MT-32: NO ROMS");
+    if (want == 2 && !sc55_is_open()) toast("STATE WANTS SC-55: NO ROMS");
 }
 
 static void perf_load_sel(void)
@@ -1143,6 +1310,148 @@ static void draw_mt32(const UiStatus *st)
     gfx_text(g_fonts.mo10, 28, SCR_H - 58, "PAD MOVES   O + PAD CHANGES   X ACTS ON THE ROW   ROM FOLDER ROW: X REOPENS   START ALL OFF", C_GREY, 255, 0);
 }
 
+/* ---- SC-55 -------------------------------------------------------------------- */
+static void draw_sc55(const UiStatus *st)
+{
+    char b[96];
+    int open = sc55_is_open();
+    /* the Sound Canvas bar display: a column of sixteen segments per part */
+    gfx_round(16, 58, SCR_W - 32, 96, 12, C_DEEP, 255);
+    gfx_frame(16, 58, SCR_W - 32, 96, 12, C_LINE, 255);
+    gfx_text(g_fonts.s11, 44, 70, "LEVEL", C_GREY, 255, 2);
+    gfx_text_right(g_fonts.mo10, SCR_W - 44, 71, open ? g_sc55.status : "16 PARTS", C_GREY, 255, 0);
+    for (int p = 0; p < 16; p++) {
+        int bx = 44 + p * 55;
+        for (int s2 = 0; s2 < 8; s2++) {
+            int lit = open && g_sc55.bars[p] > s2 * 2;
+            gfx_fill(bx, 134 - s2 * 6, 40, 4, lit ? C_MINT : C_PANEL2, 255);
+        }
+        snprintf(b, sizeof b, "%d", p + 1);
+        gfx_text_center(g_fonts.mo10, bx + 20, 140, b, C_GREY, 255, 0);
+    }
+    if (!open && g_syn_mode != 2)
+        gfx_text(g_fonts.mo44, 44, 84, "NO ROMS LOADED", C_GREY, 255, 6);
+
+    /* settings and cards */
+    int cx = 16, cy = 170, cw = 300;
+    card(cx, cy, cw, 170);
+    gfx_text(g_fonts.s11, cx + 16, cy + 12, "MODULE", C_GREY, 255, 2);
+    static const char *labels[SCR_MODULE_ROWS] = { "MODE", "SOUND MAP", "OUTPUT GAIN", "ROM FOLDER" };
+    for (int r = 0; r < SCR_MODULE_ROWS; r++) {
+        int y = cy + 36 + r * 30;
+        int sel = r == s_sc_row;
+        if (sel) { gfx_round(cx + 8, y - 4, cw - 16, 26, 5, C_PANEL2, 255); gfx_fill(cx + 8, y, 2, 18, C_MINT, 255); }
+        gfx_text(g_fonts.s11, cx + 16, y + 3, labels[r], sel ? C_TEXT : C_GREY, 255, 2);
+        switch (r) {
+        case SCR_MODE:
+            gfx_text_right(g_fonts.mo14, cx + cw - 16, y, g_syn_mode == 2 ? "SC-55" : g_syn_mode == 1 ? "MT-32" : "GM", g_syn_mode == 2 ? C_MINT : C_TEXT, 255, 0);
+            break;
+        case SCR_SOUNDMAP:
+            gfx_text_right(g_fonts.mo14, cx + cw - 16, y, SOUNDMAP_NAME[g_sc55.soundmap > 2 ? 0 : g_sc55.soundmap], C_TEXT, 255, 0);
+            break;
+        case SCR_GAIN:
+            snprintf(b, sizeof b, "%d", g_sc55.gain);
+            gfx_text_right(g_fonts.mo14, cx + cw - 16, y, b, C_TEXT, 255, 0);
+            break;
+        default:
+            gfx_text_right(g_fonts.mo14, cx + cw - 16, y, "X REOPEN", C_TEXT, 255, 0);
+            break;
+        }
+    }
+    gfx_text(g_fonts.mo10, cx + 16, cy + 36 + SCR_MODULE_ROWS * 30 + 2, "THE SOUND MAP RESETS THE MODULE", C_GREY, 255, 0);
+
+    /* emulation settings, applied at once */
+    int ex = cx + cw + 12, ew = 300;
+    card(ex, cy, ew, 108);
+    gfx_text(g_fonts.s11, ex + 16, cy + 12, "EMULATION", C_GREY, 255, 2);
+    static const char *elabels[3] = { "VOICES", "VOICE STEALING", "CORES" };
+    for (int r = 0; r < 3; r++) {
+        int y = cy + 34 + r * 24, row = SCR_POLY + r;
+        int sel = row == s_sc_row;
+        if (sel) { gfx_round(ex + 8, y - 3, ew - 16, 22, 5, C_PANEL2, 255); gfx_fill(ex + 8, y, 2, 15, C_MINT, 255); }
+        gfx_text(g_fonts.s11, ex + 16, y + 1, elabels[r], sel ? C_TEXT : C_GREY, 255, 2);
+        const char *v;
+        switch (row) {
+        case SCR_POLY:
+            if (g_sc55.polycap_set == 0) snprintf(b, sizeof b, "%d  THE REAL UNIT", g_sc55.polycap);
+            else snprintf(b, sizeof b, "%d OF 64", g_sc55.polycap);
+            v = b;
+            break;
+        case SCR_STEAL: v = g_sc55.steal ? "ON" : "OFF  NOTES DROP"; break;
+        default: snprintf(b, sizeof b, "%d OF 3  (%d RUN)", g_sc55.cores ? g_sc55.cores : 1, g_sc55.cores_used ? g_sc55.cores_used : 1); v = b; break;
+        }
+        gfx_text_right(g_fonts.mo11, ex + ew - 16, y, v, C_TEXT, 255, 0);
+    }
+    card(ex, cy + 116, ew, 126);
+    gfx_text(g_fonts.s11, ex + 16, cy + 128, "ROMS", C_GREY, 255, 2);
+    gfx_text(g_fonts.s12, ex + 16, cy + 144, "Control", C_TEXT, 255, 0);
+    gfx_text_fit(g_fonts.mo10, ex + 76, cy + 146, ew - 92, open ? g_sc55.prog_file : "-", C_TEXT2, 255);
+    gfx_text(g_fonts.s12, ex + 16, cy + 160, "CPU", C_TEXT, 255, 0);
+    gfx_text_fit(g_fonts.mo10, ex + 76, cy + 162, ew - 92, open ? g_sc55.cpu_file : "-", C_TEXT2, 255);
+    gfx_text(g_fonts.s12, ex + 16, cy + 176, "Wave", C_TEXT, 255, 0);
+    gfx_text_fit(g_fonts.mo10, ex + 76, cy + 178, ew - 92, open ? g_sc55.wave_files : "ux0:data/prism/sc55", C_TEXT2, 255);
+    if (open) {
+        const char *how = (g_sc55.lut_cpu == 2 || g_sc55.lut_prog == 2) ? "TABLES FOUND BY SCAN"
+                        : (g_sc55.lut_cpu == 1 || g_sc55.lut_prog == 1) ? "TABLES VERIFIED" : "A KNOWN BUILD";
+        if (g_sc55.lut_cpu == 2) snprintf(b, sizeof b, "%s  (CPU %+d)", how, g_sc55.lut_dcpu);
+        else snprintf(b, sizeof b, "%s", how);
+        gfx_text_fit(g_fonts.mo10, ex + 16, cy + 198, ew - 32, b, C_GREY, 255);
+        snprintf(b, sizeof b, "%s v%s  -  %d VOICES", g_sc55.model, g_sc55.version, g_sc55.poly_model);
+        gfx_text_fit(g_fonts.mo10, ex + 16, cy + 212, ew - 32, b, C_GREY, 255);
+    }
+
+    int sx = ex + ew + 12, sw = SCR_W - 16 - sx;
+    card(sx, cy, sw, 242);
+    gfx_text(g_fonts.s11, sx + 16, cy + 12, "STATUS", C_GREY, 255, 2);
+    if (open) {
+        gfx_text(g_fonts.s12, sx + 16, cy + 32, g_syn_mode == 2 ? "SC-55 ENGINE ACTIVE" : "SC-55 ENGINE STANDBY", g_syn_mode == 2 ? C_MINT : C_TEXT2, 255, 0);
+        static const char *CL[3] = { "CPU 1  AUDIO", "CPU 2  HELPER", "CPU 0  HELPER + PANEL" };
+        int bx = sx + 16, bw = sw - 32;
+        for (int i = 0; i < 3; i++) {
+            int y = cy + 50 + i * 26;
+            int v = st->core_load[i] < 0 ? 0 : st->core_load[i] > 100 ? 100 : st->core_load[i];
+            gfx_text(g_fonts.mo10, bx, y, CL[i], C_GREY, 255, 0);
+            if (i == 0) {
+                int wv = st->load < 0 ? 0 : st->load > 100 ? 100 : st->load;
+                snprintf(b, sizeof b, "%d%%  WORST %d%%", v, st->load);
+                gfx_text_right(g_fonts.mo10, sx + sw - 16, y, b, st->load >= 100 ? C_AMBER : C_TEXT, 255, 0);
+                gfx_fill(bx, y + 13, bw, 6, C_PANEL2, 255);
+                gfx_fill(bx, y + 13, bw * v / 100, 6, v >= 85 ? C_AMBER : C_MINT, 255);
+                gfx_fill(bx + bw * wv / 100 - 1, y + 11, 2, 10, C_TEXT, 255);
+            } else {
+                snprintf(b, sizeof b, "%d%%", v);
+                gfx_text_right(g_fonts.mo10, sx + sw - 16, y, b, C_TEXT, 255, 0);
+                gfx_fill(bx, y + 13, bw, 6, C_PANEL2, 255);
+                gfx_fill(bx, y + 13, bw * v / 100, 6, v >= 85 ? C_AMBER : C_MINT, 255);
+            }
+        }
+        {   /* voices against the cap */
+            int y = cy + 128, pm = g_sc55.polycap ? g_sc55.polycap : 24;
+            int pv = g_sc55.voices > pm ? pm : g_sc55.voices;
+            gfx_text(g_fonts.mo10, bx, y, "VOICES", C_GREY, 255, 0);
+            snprintf(b, sizeof b, "%d / %d", g_sc55.voices, pm);
+            gfx_text_right(g_fonts.mo10, sx + sw - 16, y, b, C_TEXT, 255, 0);
+            gfx_fill(bx, y + 13, bw, 6, C_PANEL2, 255);
+            gfx_fill(bx, y + 13, bw * pv / pm, 6, pv >= pm ? C_AMBER : C_MINT, 255);
+        }
+        snprintf(b, sizeof b, "BENCH %%  1C %d  2C %d  3C %d  STEAL %d", g_sc55.bench[0], g_sc55.bench[1], g_sc55.bench[2], g_sc55.bench[3]);
+        gfx_text_fit(g_fonts.mo10, bx, cy + 154, bw, b, C_GREY, 255);
+        snprintf(b, sizeof b, "GS SYSEX AND VARIATIONS WORK AS ON THE UNIT");
+        gfx_text_fit(g_fonts.mo10, bx, cy + 168, bw, b, C_GREY, 255);
+        if (st->load >= 100) gfx_text_fit(g_fonts.mo10, bx, cy + 182, bw, "DROPOUTS: RAISE AUDIO AHEAD ON SETUP", C_AMBER, 255);
+    } else {
+        gfx_text(g_fonts.s12, sx + 16, cy + 32, "NO ROMS LOADED", C_AMBER, 255, 0);
+        gfx_text_fit(g_fonts.mo10, sx + 16, cy + 56, sw - 32, "ux0:data/prism/sc55", C_TEXT2, 255);
+        gfx_text_fit(g_fonts.mo10, sx + 16, cy + 72, sw - 32, "CONTROL (256/512 KB) + CPU (32 KB) ROM", C_GREY, 255);
+        gfx_text_fit(g_fonts.mo10, sx + 16, cy + 86, sw - 32, "WAVE ROMS, NAMED TO SORT IN BANK ORDER", C_GREY, 255);
+        gfx_text_fit(g_fonts.mo10, sx + 16, cy + 100, sw - 32, "SC-55, SC-55MKII, SC-155 AND SCC-1 SETS LOAD", C_GREY, 255);
+        gfx_text_fit(g_fonts.s12, sx + 16, cy + 122, sw - 32, g_sc55.status[0] ? g_sc55.status : "Nothing loaded.", C_AMBER, 255);
+        snprintf(b, sizeof b, "%d file%s seen", g_sc55.roms_found, g_sc55.roms_found == 1 ? "" : "s");
+        gfx_text(g_fonts.mo10, sx + 16, cy + 146, b, C_GREY, 255, 0);
+    }
+    gfx_text(g_fonts.mo10, 28, SCR_H - 58, "PAD MOVES   O + PAD CHANGES   X ACTS ON THE ROW   ROM FOLDER ROW: X REOPENS   START ALL OFF", C_GREY, 255, 0);
+}
+
 static void draw_soon(const char *what)
 {
     card(SCR_W / 2 - 220, 200, 440, 120);
@@ -1302,6 +1611,78 @@ static void play_input_mt32(const PlatPad *pad, unsigned int dn, unsigned int na
     } else touch_knob = -1;
 }
 
+static void play_input_sc55(const PlatPad *pad, unsigned int dn, unsigned int nav, unsigned int b, int edit, int tdown)
+{
+    static int touch_knob = -1;
+    if (s_browse) {   /* tone list has the pad */
+        static int br_ms = 0, br_stick = 0;
+        int ud = (b & SCE_CTRL_DOWN) ? 1 : (b & SCE_CTRL_UP) ? -1 : 0;
+        if (ud) { if (dn & (SCE_CTRL_UP | SCE_CTRL_DOWN)) { sc_browse_move(ud); br_ms = 0; } else if (++br_ms > 16 && (br_ms & 1)) sc_browse_move(ud); }
+        else br_ms = 0;
+        int sy = pad->ry < 90 ? -1 : pad->ry > 166 ? 1 : 0;
+        if (sy) { if (++br_stick == 1 || br_stick > 14) { sc_browse_move(sy); if (br_stick > 14) br_stick = 10; } } else br_stick = 0;
+        if (dn & SCE_CTRL_CIRCLE) s_browse = 0;
+        if (dn & SCE_CTRL_CROSS) { s_aud_note = g_sc55.drum[s_part] ? 36 : 60; syn_event(SEV_NOTE_ON, s_part, s_aud_note, 100); }
+        if (!(b & SCE_CTRL_CROSS) && s_aud_note >= 0) { syn_event(SEV_NOTE_OFF, s_part, s_aud_note, 0); s_aud_note = -1; }
+        if (pad->touch) {
+            static int drag_y = -1, drag_cur = 0;
+            int h = BR_ROWS * BR_ROW_H + 52;
+            if (tdown) {
+                if (pad->tx < BR_X || pad->tx >= BR_X + BR_W || pad->ty < BR_Y || pad->ty >= BR_Y + h) { s_browse = 0; drag_y = -1; }
+                else { drag_y = pad->ty; drag_cur = s_browse_cur; }
+            } else if (drag_y >= 0) {
+                int nc = drag_cur + (drag_y - pad->ty) / BR_ROW_H;
+                if (nc < 0) nc = 0;
+                if (nc > 127) nc = 127;
+                if (nc != s_browse_cur) { s_browse_cur = nc; sc_set(s_part, SP_INST, nc); }
+            }
+        }
+        return;
+    }
+    if (dn & SCE_CTRL_TRIANGLE) { s_browse_cur = g_sc55.prog[s_part]; s_browse = 1; return; }
+    if (s_focus == 0) {
+        if (nav & SCE_CTRL_UP) s_part = (s_part + 15) % 16;
+        if (nav & SCE_CTRL_DOWN) s_part = (s_part + 1) % 16;
+        if (nav & SCE_CTRL_RIGHT) s_focus = 1;
+        if (edit) sc_set(s_part, SP_INST, g_sc55.prog[s_part] + edit);
+    } else {
+        if (s_row >= SP_COUNT) s_row = 0;
+        if (nav & SCE_CTRL_UP) s_row = (s_row + SP_COUNT - 1) % SP_COUNT;
+        if (nav & SCE_CTRL_DOWN) s_row = (s_row + 1) % SP_COUNT;
+        if (nav & SCE_CTRL_LEFT) s_focus = 0;
+        if (edit) sc_set(s_part, s_row, sc_get(s_part, s_row) + edit * (s_row >= SP_LEVEL ? 2 : 1));
+    }
+    if (dn & SCE_CTRL_CROSS) { s_aud_note = g_sc55.drum[s_part] ? 36 : 60; syn_event(SEV_NOTE_ON, s_part, s_aud_note, 100); }
+    if (!(b & SCE_CTRL_CROSS) && s_aud_note >= 0) { syn_event(SEV_NOTE_OFF, s_part, s_aud_note, 0); s_aud_note = -1; }
+    /* touch: part row, name row, or a setting */
+    if (pad->touch) {
+        int cy0 = RAIL_Y - 14, ly = cy0 + 72, vx = CARD_X + 124, sw = CARD_W - 124 - 54;
+        if (tdown) {
+            touch_knob = -1;
+            if (pad->tx >= RAIL_X && pad->tx < RAIL_X + RAIL_W && pad->ty >= RAIL_Y && pad->ty < RAIL_Y + 16 * ROW_H) {
+                s_part = (pad->ty - RAIL_Y) / ROW_H; s_focus = 0;
+            } else if (pad->tx >= CARD_X - 8 && pad->tx < CARD_X + CARD_W + 8 && pad->ty >= cy0 + 20 && pad->ty < cy0 + 52) {
+                if (pad->tx >= CARD_X + CARD_W - 62 && pad->tx < CARD_X + CARD_W - 32) sc_set(s_part, SP_INST, g_sc55.prog[s_part] - 1);
+                else if (pad->tx >= CARD_X + CARD_W - 30) sc_set(s_part, SP_INST, g_sc55.prog[s_part] + 1);
+                else { s_browse_cur = g_sc55.prog[s_part]; s_browse = 1; }
+            } else if (pad->tx >= CARD_X - 8 && pad->tx < CARD_X + CARD_W + 8 && pad->ty >= ly - 3 && pad->ty < ly + SP_COUNT * 22) {
+                int r = (pad->ty - (ly - 3)) / 22;
+                if (r >= 0 && r < SP_COUNT) {
+                    s_focus = 1; s_row = r;
+                    if (r == SP_INST && pad->tx >= vx) { s_browse_cur = g_sc55.prog[s_part]; s_browse = 1; }
+                    else if (r == SP_BANK && pad->tx >= vx) sc_set(s_part, SP_BANK, (g_sc55.bank[s_part] + 8) & 127);
+                    else if (r == SP_CH && pad->tx >= vx) sc_set(s_part, SP_CH, (g_sc55.chan[s_part] + 1) % 17);
+                    else if (r > SP_CH && pad->tx >= vx - 8) touch_knob = r;
+                }
+            }
+        }
+        if (touch_knob > SP_CH) {
+            int v = (pad->tx - vx) * 127 / (sw - 8);
+            if (v != sc_get(s_part, touch_knob)) sc_set(s_part, touch_knob, v);
+        }
+    } else touch_knob = -1;
+}
+
 static void handle_input(const PlatPad *pad, const UiStatus *st)
 {
     static unsigned int prev = 0;
@@ -1349,6 +1730,7 @@ static void handle_input(const PlatPad *pad, const UiStatus *st)
     switch (s_page) {
     case PG_PLAY:
         if (g_syn_mode == 1 && mt32_is_open()) { play_input_mt32(pad, dn, nav, b, edit, tdown); if (dn & SCE_CTRL_CIRCLE) o_used = 1; break; }
+        if (g_syn_mode == 2 && sc55_is_open()) { play_input_sc55(pad, dn, nav, b, edit, tdown); if (dn & SCE_CTRL_CIRCLE) o_used = 1; break; }
         if (s_browse) {   /* patch browser has the pad */
             static int br_ms = 0, br_stick = 0;
             int ud = (b & SCE_CTRL_DOWN) ? 1 : (b & SCE_CTRL_UP) ? -1 : 0;
@@ -1641,6 +2023,50 @@ static void handle_input(const PlatPad *pad, const UiStatus *st)
         }
         break;
     }
+    case PG_SC55: {
+        /* two columns: MODULE (four rows) and EMULATION (three rows) */
+        int scol = s_sc_row < SCR_MODULE_ROWS ? 0 : 1;
+        if (nav & SCE_CTRL_UP) s_sc_row = scol == 0 ? (s_sc_row == 0 ? SCR_MODULE_ROWS - 1 : s_sc_row - 1) : (s_sc_row == SCR_POLY ? SCR_COUNT - 1 : s_sc_row - 1);
+        if (nav & SCE_CTRL_DOWN) s_sc_row = scol == 0 ? (s_sc_row == SCR_MODULE_ROWS - 1 ? 0 : s_sc_row + 1) : (s_sc_row == SCR_COUNT - 1 ? SCR_POLY : s_sc_row + 1);
+        if ((nav & SCE_CTRL_RIGHT) && scol == 0) s_sc_row = SCR_POLY + (s_sc_row < 3 ? s_sc_row : 2);
+        if ((nav & SCE_CTRL_LEFT) && scol == 1) s_sc_row = s_sc_row - SCR_POLY;
+        int act = edit != 0 || (dn & SCE_CTRL_CROSS) != 0;
+        if (tdown) {   /* tap on a row selects it; tap on its value changes it */
+            int cx = 16, cy = 170, cw = 300, ex = cx + cw + 12, ew = 300;
+            if (pad->tx >= cx && pad->tx < cx + cw && pad->ty >= cy + 32 && pad->ty < cy + 32 + SCR_MODULE_ROWS * 30) {
+                s_sc_row = (pad->ty - (cy + 32)) / 30;
+                if (pad->tx >= cx + cw / 2) act = 1;
+            } else if (pad->tx >= ex && pad->tx < ex + ew && pad->ty >= cy + 31 && pad->ty < cy + 31 + 3 * 24) {
+                s_sc_row = SCR_POLY + (pad->ty - (cy + 31)) / 24;
+                if (pad->tx >= ex + ew / 2) act = 1;
+            }
+        }
+        if (act) {
+            int d = edit ? edit : 1;
+            switch (s_sc_row) {
+            case SCR_MODE: syn_event(SEV_MODE, 0, g_syn_mode == 2 ? 0 : 2, 0); break;
+            case SCR_SOUNDMAP: sc55_set_map((g_sc55.soundmap + 3 + d) % 3); break;
+            case SCR_GAIN: sc55_set_gain(g_sc55.gain + d * 4); break;
+            case SCR_POLY: {   /* 0 (the real unit) then 8..64 in fours */
+                int v = g_sc55.polycap_set;
+                v = v == 0 ? (d > 0 ? 8 : 64) : v + d * 4;
+                if (v < 8 || v > 64) v = 0;
+                sc55_set_polycap(v);
+                break;
+            }
+            case SCR_STEAL: sc55_set_steal(!g_sc55.steal); break;
+            case SCR_CORES: sc55_set_cores((g_sc55.cores ? g_sc55.cores : 1) + d); break;
+            default: break;
+            }
+        }
+        if (act && s_sc_row == SCR_RESCAN && !edit) {   /* reopen and return to the previous mode */
+            int was_sc = g_syn_mode == 2;
+            if (was_sc) { syn_event(SEV_MODE, 0, 0, 0); plat_sleep_ms(30); }
+            sc55_open("ux0:data/prism/sc55");
+            if (was_sc && sc55_is_open()) syn_event(SEV_MODE, 0, 2, 0);
+        }
+        break;
+    }
     case PG_FX: {
         /* three columns: reverb and chorus, EQ and output, the part sends */
         static const int LO[3] = { FXS_REV_SIZE, FXS_EQ_LO, FXS_PART_REV }, HI[3] = { FXS_CHO_LEVEL, FXS_MASTER, FXS_PART_CHO };
@@ -1696,15 +2122,21 @@ void ui_frame(const UiStatus *st, const PlatPad *pad, int draw)
     gfx_clear(C_BG);
     switch (s_page) {
     case PG_PLAY:
-        topbar(st, g_syn_mode == 1 && mt32_is_open() ? "MT-32 MODULE" : "SOUND MODULE");
+        topbar(st, g_syn_mode == 1 && mt32_is_open() ? "MT-32 MODULE"
+                 : g_syn_mode == 2 && sc55_is_open() ? "SOUND CANVAS" : "SOUND MODULE");
         draw_play(st);
-        if (s_browse) { if (g_syn_mode == 1 && mt32_is_open()) draw_browser_mt32(); else draw_browser(); }
+        if (s_browse) {
+            if (g_syn_mode == 1 && mt32_is_open()) draw_browser_mt32();
+            else if (g_syn_mode == 2 && sc55_is_open()) draw_browser_sc55();
+            else draw_browser();
+        }
         break;
     case PG_MIX: topbar(st, "MIX"); draw_mix(st); break;
     case PG_SETUP: topbar(st, "SETUP"); draw_setup(st); break;
     case PG_PERFORM: topbar(st, "PERFORM"); draw_perform(st); break;
     case PG_FX: topbar(st, "EFFECTS"); draw_fx(st); break;
     case PG_MT32: topbar(st, "MT-32 MODE"); draw_mt32(st); break;
+    case PG_SC55: topbar(st, "SC-55 MODE"); draw_sc55(st); break;
     default: break;
     }
     tabbar();

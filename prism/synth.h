@@ -30,7 +30,7 @@ extern volatile int g_syn_load;      /* worst block time over the last second, p
 extern volatile int g_syn_load_avg;  /* mean block time over the same window, percent */
 extern volatile int g_syn_core_load[3];   /* mean busy time per core over the window, percent: audio core, helper 1, helper 2 */
 extern volatile int g_syn_cores;          /* threads the SoundFont parts render on, 1..3 */
-extern volatile int g_syn_mode;      /* 0 = SoundFont engine, 1 = MT-32 mode; owned by the audio thread */
+extern volatile int g_syn_mode;      /* 0 = SoundFont engine, 1 = MT-32, 2 = SC-55; owned by the audio thread */
 extern char g_syn_bank_name[64];     /* file name of the loaded bank */
 extern long g_syn_bank_bytes;        /* memory used by the bank (its file size); 0 = none */
 
@@ -51,9 +51,12 @@ const char *syn_preset_name_of(int part);
 enum { SEV_PROG = 1, SEV_LEVEL, SEV_PAN, SEV_CUT, SEV_RES, SEV_ATK, SEV_REL, SEV_MUTE,
        SEV_MASTER, SEV_NOTE_ON, SEV_NOTE_OFF, SEV_ALLOFF, SEV_POLY, SEV_BANK,
        SEV_RX, SEV_LOW, SEV_HIGH, SEV_TRANS /* a = trans + 24 */, SEV_REV, SEV_CHO,
-       SEV_MODE /* a = 0 GM, 1 MT-32 */,
+       SEV_MODE /* a = 0 GM, 1 MT-32, 2 SC-55 */,
        /* MT-32 mode, part = 0..8 (8 = rhythm) */
-       SEV_MT_CH /* a = 0..15, 16 off */, SEV_MT_PROG, SEV_MT_VOL, SEV_MT_PAN, SEV_MT_MAP /* a = stock */ };
+       SEV_MT_CH /* a = 0..15, 16 off */, SEV_MT_PROG, SEV_MT_VOL, SEV_MT_PAN, SEV_MT_MAP /* a = stock */,
+       /* SC-55 mode, part = 0..15 */
+       SEV_SC_CH /* a = 0..15, 16 off */, SEV_SC_PROG, SEV_SC_BANK, SEV_SC_LEVEL,
+       SEV_SC_PAN, SEV_SC_REV, SEV_SC_CHO };
 #define SYN_RX_OMNI 16
 #define SYN_RX_OFF  17
 void syn_event(int kind, int part, int a, int b);

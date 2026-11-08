@@ -1,4 +1,4 @@
-PRISM 0.25 - credits
+PRISM 0.26 - credits
 
 PRISM is written by eggstoastbacon (HobbyChop).
 
@@ -17,6 +17,21 @@ Munt (libmt32emu) 2.8.2
   release, and the modified source is in the PRISM repository at
   https://github.com/HobbyChop/prism or from the author on request.
   Home: https://github.com/munt/munt
+
+libEmuSC 0.7.0
+  The Sound Canvas (SC-55) emulator library, by Håkon Skjelten, with
+  reverse-engineering groundwork from the Nuked-SC55 project by nukeykt
+  and the SC55_Soundfont work of Kitrinx and NewRisingSun. GNU Lesser
+  General Public License 2.1, licenses/LGPL-2.1-EmuSC.txt. PRISM links
+  it statically and modifies it: parts render on several threads, voice
+  stealing replaces dropped notes at the polyphony cap, portamento and
+  poly aftertouch are completed, and the ROM lookup tables are located
+  by shape so firmware builds beyond 1.21 and 1.01 load (the SC-155 and
+  SCC-1 among them). The changes are in licenses/emusc-prism.patch, a
+  diff against the upstream v0.7.0 release, and the modified source is
+  in the PRISM repository at https://github.com/HobbyChop/prism or from
+  the author on request.
+  Home: https://github.com/skjelten/emusc
 
 TinySoundFont 0.9
   The SoundFont player. Copyright (C) 2017-2025 Bernhard Schelling, based
@@ -43,5 +58,6 @@ vitasdk and taiHEN
   The toolchain and the plugin framework the MIDI kernel module runs
   under. The USB device driver follows the structure of xerpi's vitastick.
 
-MT-32 and CM-32L ROM images are the property of Roland and are not
-included. PRISM reads the ones you place in ux0:data/prism/mt32.
+MT-32, CM-32L and SC-55 ROM images are the property of Roland and are
+not included. PRISM reads the ones you place in ux0:data/prism/mt32 and
+ux0:data/prism/sc55.

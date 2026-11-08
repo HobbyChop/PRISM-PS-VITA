@@ -1,0 +1,685 @@
+/*  
+ *  This file is part of libEmuSC, a Sound Canvas emulator library
+ *  Copyright (C) 2022-2026  Håkon Skjelten
+ *
+ *  libEmuSC is free software: you can redistribute it and/or modify it
+ *  under the terms of the GNU Lesser General Public License as published
+ *  by the Free Software Foundation, either version 2.1 of the License, or
+ *  (at your option) any later version.
+ *
+ *  libEmuSC is distributed in the hope that it will be useful, but
+ *  WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU Lesser General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with libEmuSC. If not, see <http://www.gnu.org/licenses/>.
+ */
+
+
+#include "part.h"
+
+#include <algorithm>
+#include <climits>
+#include <cmath>
+#include <iostream>
+
+
+namespace EmuSC {
+
+Part::Part(uint8_t id, Settings *settings, ControlRom &ctrlRom, WaveRom &waveRom)
+  : _id(id),
+    _settings(settings),
+    _lastPeakSample(0),
+    _ctrlRom(ctrlRom),
+    _waveRom(waveRom),
+    _lastPitchBendRange(2),
+    _busActive(false),
+    _choSend(0),
+    _revSend(0),
+    _portaCtrlKey(-1)
+{
+  // TODO: Rename mode => synthMode and set proper defaults for MT32 mode
+  _notesMutex = new std::mutex();
+
+  _partialReserve = 2;           // TODO: Add this to settings with propoer val
+
+  _busDry[0].fill(0.0f);
+  _busDry[1].fill(0.0f);
+  _lastBase[0] = _lastBase[1] = INT_MIN;
+}
+
+
+Part::~Part()
+{
+  delete_all_notes();
+  delete _notesMutex;
+}
+
+
+// All Sound Canvas modules generates 256 samples per control update.
+// The part renders into its own buffers; the synth sums them afterwards.
+void Part::render_block(void)
+{
+  _notesMutex->lock();
+
+  _busActive = _notes.size() > 0;
+
+  // Only process notes if we have any
+  if (_busActive) {
+    _busDry[0].fill(0.0f);
+    _busDry[1].fill(0.0f);
+
+    // TODO: Figure out a proper way to efficiently calculate new controller
+    //       values when needed. Is PitchBend the only one that needs this?
+    uint8_t pbRng = _settings->get_param(PatchParam::PB_PitchControl, _id) - 0x40;
+    if (pbRng != _lastPitchBendRange) {
+      _lastPitchBendRange = pbRng;
+      _settings->update_pitchBend_factor(_id);
+    }
+
+    // Get next sample from active notes, delete those which are finished
+    std::list<Note*>::iterator itr = _notes.begin();
+    while (itr != _notes.end()) {
+      bool finished = (*itr)->get_sample_set(_busDry);
+
+      if (finished) {
+        delete *itr;
+        itr = _notes.erase(itr);
+      } else {
+        ++itr;
+      }
+    }
+
+    // Store last (highest) value for future queries (typically for bar display)
+    float pk = *std::max_element(_busDry[0].begin(), _busDry[0].end());
+    pk = std::max(pk, *std::max_element(_busDry[1].begin(), _busDry[1].end()));
+    _lastPeakSample = pk;
+
+    _choSend = _settings->get_param(PatchParam::ChorusSendLevel, _id) / 128.0f;
+    _revSend = _settings->get_param(PatchParam::ReverbSendLevel, _id) / 128.0f;
+  }
+
+  // Export envelopes and LFOs to external client
+  if (_envelopeCallback && !_notes.empty())
+    _envelopeCallback(_notes.front()->get_current_pitch(0),
+		      _notes.front()->get_current_pitch(1),
+		      _notes.front()->get_current_tvf(0),
+		      _notes.front()->get_current_tvf(1),
+		      _notes.front()->get_current_tva(0),
+		      _notes.front()->get_current_tva(1));
+
+  if (_lfoCallback) {
+    if (!_notes.empty())
+      _lfoCallback(_notes.front()->get_current_lfo(0),
+		   _notes.front()->get_current_lfo(1),
+		   _notes.front()->get_current_lfo(2));
+    else
+      _lfoCallback(0, 0, 0);
+  }
+
+  _notesMutex->unlock();
+}
+
+
+/* PRISM: the part's best victim for voice stealing. Lower score = better:
+ * a releasing note scores its current TVA level (quiet tails go first), a
+ * sounding note scores far above that, oldest first. */
+Note *Part::steal_candidate(long *score)
+{
+  Note *best = NULL;
+  long bs = 0;
+  _notesMutex->lock();
+  for (auto n : _notes) {
+    long s;
+    if (n->releasing())
+      s = n->tva_max();
+    else
+      s = 0x10000L + (long) n->seq();
+    if (!best || s < bs) { best = n; bs = s; }
+  }
+  _notesMutex->unlock();
+  if (best) *score = bs;
+  return best;
+}
+
+
+int Part::kill_note(Note *n)
+{
+  int freed = 0;
+  _notesMutex->lock();
+  for (std::list<Note*>::iterator it = _notes.begin(); it != _notes.end(); ++it)
+    if (*it == n) {
+      freed = n->get_num_partials();
+      delete n;
+      _notes.erase(it);
+      break;
+    }
+  _notesMutex->unlock();
+  return freed;
+}
+
+
+void Part::update(void)
+{
+  for (auto &n : _notes)
+    n->update();
+}
+
+
+int Part::get_last_peak_sample(void)
+{
+  if (_settings->get_param(PatchParam::Mute, _id) ||
+      _settings->get_param(SystemParam::Mute))
+    return -1;
+
+  // Formula for peak display level: bars = (max(TVA) * PartScale) / 8;
+
+  // Calculate part scale
+  int scale = _settings->get_param(PatchParam::Expression, _id) *
+              _settings->get_param(PatchParam::PartLevel, _id) *
+              _settings->get_param(SystemParam::Volume);
+  scale = (((4 * scale) >> 8) & 0xffff);
+  scale = ((scale * 0x8208) >> 16);
+  scale = ((scale * 2) & 0xffff) + 0xff;
+  if (scale >= 0x8000) scale = 0x7f00;
+  scale >>= 8;
+
+  int tvaMax = 0;
+  _notesMutex->lock();
+
+  for (auto &n: _notes)
+    tvaMax = std::max({tvaMax, n->get_current_tva(0), n->get_current_tva(1)});
+
+  _notesMutex->unlock();
+
+  if (0)
+    std::cout << "PartScale=" << std::hex << scale
+              << " tvaMax=" << tvaMax
+              << " => " << ((scale * tvaMax) >> 11)
+              << std::endl;
+
+  return (scale * tvaMax) >> 11;
+}
+
+
+int Part::get_num_partials(void)
+{
+  if (_notes.size() == 0)
+    return 0;
+
+  int numPartials = 0;
+  for (auto &n: _notes)
+    numPartials += n->get_num_partials();
+
+  return numPartials;
+}
+
+
+// Note: Mute cancels all active keys in part, and all new keys are ignored
+int Part::add_note(uint8_t key, uint8_t keyVelocity)
+{
+  // 1. Check if part is muted or rxNoteMessage is disabled
+  if (_settings->get_param(PatchParam::Mute, _id) ||
+      _settings->get_param(SystemParam::Mute) ||
+      !_settings->get_param(PatchParam::RxNoteMessage, _id))
+    return 0;
+
+  // 2. Check if key is outside part configured key range
+  if (key < _settings->get_param(PatchParam::KeyRangeLow, _id) ||
+      key > _settings->get_param(PatchParam::KeyRangeHigh, _id))
+    return 0;
+
+  // 4. If note is a drum -> check if drum accepts note on
+  uint8_t drumSetIndex = _settings->get_param(PatchParam::ToneNumber, _id);
+  uint8_t rhythm = _settings->get_param(PatchParam::UseForRhythm, _id);
+  if (rhythm != mode_Norm &&
+      !(_settings->get_param(DrumParam::RxNoteOn, rhythm - 1, key)))
+    return 0;
+
+  // 5. Calculate corrected key velocity based on velocity sens depth & offset
+  //    according to description in SC-55 owner's manual page 38
+  uint8_t velSensDepth =
+    _settings->get_param(PatchParam::VelocitySenseDepth, _id);
+  uint8_t velSensOffset =
+    _settings->get_param(PatchParam::VelocitySenseOffset, _id);
+  float v = keyVelocity * (velSensDepth / 64.0);
+  if (velSensOffset >= 64)
+    v += velSensOffset - 64;
+  else
+    v *= (velSensOffset + 64) / 127.0;
+  uint8_t velocity = (v <= 127) ? std::roundf(v) : 127;
+
+  // 6. Portamento: pick the glide source before mono mode clears the list.
+  //    CC 84 names the source key for this one note; otherwise the glide
+  //    starts from the previous note's pitch - mid-glide, its current pitch.
+  int portaSrc[2] = { INT_MIN, INT_MIN };
+  int pCtrl = _portaCtrlKey;
+  _portaCtrlKey = -1;
+  if (_settings->get_param(PatchParam::Portamento, _id) &&
+      _settings->get_param(PatchParam::UseForRhythm, _id) == mode_Norm) {
+    if (pCtrl >= 0) {
+      portaSrc[0] = portaSrc[1] = pCtrl * 1000;
+    } else {
+      _notesMutex->lock();
+      Note *prev = _notes.empty() ? NULL : _notes.back();
+      for (int s = 0; s < 2; s++) {
+        int v = prev ? prev->porta_now(s) : INT_MIN;
+        portaSrc[s] = (v != INT_MIN) ? v : _lastBase[s];
+      }
+      _notesMutex->unlock();
+    }
+  }
+
+  // 7. Remove all existing notes if part is in mono mode according to the
+  //    SC-55 owner's manual page 39
+  if (_settings->get_param(PatchParam::PolyMode, _id) == false &&
+      _settings->get_param(PatchParam::UseForRhythm, _id) == mode_Norm)
+    delete_all_notes();
+
+  _notesMutex->lock();
+
+  Note *n = new Note(key, velocity, _ctrlRom, _waveRom, _settings, _id,
+                     portaSrc);
+  _notes.push_back(n);
+
+  _notesMutex->unlock();
+
+  // Remember this note's pitch as the next glide source
+  for (int s = 0; s < 2; s++) {
+    int v = n->porta_base(s);
+    if (v != INT_MIN) _lastBase[s] = v;
+  }
+
+  if (_settings->get_param(PatchParam::Hold1, _id))
+      n->sustain(true);
+
+  return 1;
+}
+
+
+int Part::stop_note(uint8_t key)
+{
+  for (auto &n : _notes)
+    n->stop(key);
+
+  return 0;
+}
+
+
+int Part::stop_all_notes(void)
+{
+  int i = _notes.size();
+  for (auto n : _notes)
+    n->stop();
+
+  return i;
+}
+
+
+int Part::delete_all_notes(void)
+{
+  _notesMutex->lock();
+
+  int i = _notes.size();
+  for (auto n : _notes)
+    delete n;
+
+  _notes.clear();
+
+  _notesMutex->unlock();
+
+  return i;
+}
+
+
+int Part::control_change(uint8_t msgId, uint8_t value)
+{
+  // RxControlChange does not affect Channel Mode messages
+  if (!_settings->get_param(PatchParam::RxControlChange, _id) && msgId < 120)
+    return 0;
+
+  bool updateGUI = false;
+
+  if (msgId == 0) {                                    // Bank select
+    // TODO: This check is only available for SC-55mkII+
+    if (_settings->get_param(PatchParam::RxBankSelect, _id))
+      _settings->set_param(PatchParam::ToneNumber, value, _id);
+
+  } else if (msgId == 1) {                             // Modulation
+    if (_settings->get_param(PatchParam::RxModulation, _id))
+      _settings->set_param(PatchParam::Modulation, value, _id);
+
+  } else if (msgId == 5) {                             // Portamento time
+    _settings->set_param(PatchParam::PortamentoTime, value, _id);
+
+  } else if (msgId == 6) {                             // Data entry MSB
+    // RPN
+    uint8_t msb = _settings->get_param(PatchParam::RPN_MSB, _id);
+    uint8_t lsb = _settings->get_param(PatchParam::RPN_LSB, _id);
+    if (msb != 0x7f && lsb != 0x7f)
+      if (msb == 0 && lsb == 0 && value <= 24) {         // Pitch bend range
+	_settings->set_param(PatchParam::PB_PitchControl, value + 0x40, _id);
+      } else if (msb == 0 && lsb == 1) {                 // Master fine tuning
+	_settings->set_param(PatchParam::PitchFineTune, value, _id);
+      } else if (msb == 0 && lsb == 2) {                 // Master coarse tuning
+	_settings->set_param(PatchParam::PitchCoarseTune, value, _id);
+      }
+    // NRPN
+    msb = _settings->get_param(PatchParam::NRPN_MSB, _id);
+    lsb = _settings->get_param(PatchParam::NRPN_LSB, _id);
+    if (msb != 0x7f && lsb != 0x7f)
+      if (msb == 0x01 && lsb == 0x08 && value >= 0x0e && value <= 0x72) {
+	_settings->set_param(PatchParam::VibratoRate, value, _id);
+      } else if (msb == 0x01 && lsb == 0x09 && value >= 0x0e && value <= 0x72) {
+	_settings->set_param(PatchParam::VibratoDepth, value, _id);
+      } else if (msb == 0x01 && lsb == 0x0a && value >= 0x0e && value <= 0x72) {
+	_settings->set_param(PatchParam::VibratoDelay, value, _id);
+      } else if (msb == 0x01 && lsb == 0x20 && value >= 0x0e && value <= 0x72) {
+	_settings->set_param(PatchParam::TVFCutoffFreq, value, _id);
+      } else if (msb == 0x01 && lsb == 0x21 && value >= 0x0e && value <= 0x72) {
+	_settings->set_param(PatchParam::TVFResonance, value, _id);
+      } else if (msb == 0x01 && lsb == 0x63 && value >= 0x0e && value <= 0x72) {
+	_settings->set_param(PatchParam::TVFAEnvAttack, value, _id);
+      } else if (msb == 0x01 && lsb == 0x64 && value >= 0x0e && value <= 0x72) {
+	_settings->set_param(PatchParam::TVFAEnvDecay, value, _id);
+      } else if (msb == 0x01 && lsb == 0x66 && value >= 0x0e && value <= 0x72) {
+	_settings->set_param(PatchParam::TVFAEnvRelease, value, _id);
+      } else if (msb == 0x18) {
+	int map = _settings->get_param(PatchParam::UseForRhythm, _id) - 1;
+	if (map == 0 || map == 1)
+	  _settings->set_param(DrumParam::PlayKeyNumber, map, lsb, value);
+      } else if (msb == 0x1a) {
+	int map = _settings->get_param(PatchParam::UseForRhythm, _id) - 1;
+	if (map == 0 || map == 1)
+	  _settings->set_param(DrumParam::Level, map, lsb, value);
+      } else if (msb == 0x1c) {
+	int map = _settings->get_param(PatchParam::UseForRhythm, _id) - 1;
+	if (map == 0 || map == 1)
+	  _settings->set_param(DrumParam::Panpot, map, lsb, value);
+      } else if (msb == 0x1d) {
+	int map = _settings->get_param(PatchParam::UseForRhythm, _id) - 1;
+	if (map == 0 || map == 1)
+	  _settings->set_param(DrumParam::ReverbDepth, map, lsb, value);
+      }
+
+  } else if (msgId == 7) {                             // Volume
+    if (_settings->get_param(PatchParam::RxVolume, _id)) {
+      _settings->set_param(PatchParam::PartLevel, value, _id);
+      updateGUI = true;
+    }
+
+  } else if (msgId == 10) {                            // Panpot
+    if (_settings->get_param(PatchParam::RxPanpot, _id)) {
+      _settings->set_param(PatchParam::PartPanpot, value, _id);
+      updateGUI = true;
+    }
+
+  } else if (msgId == 11) {                            // Expression
+    if (_settings->get_param(PatchParam::RxExpression, _id))
+      _settings->set_param(PatchParam::Expression, value, _id);
+
+  } else if (msgId == 38) {                            // Data entry LSB
+    // Only RPN #1
+    if (_settings->get_param(PatchParam::RPN_MSB, _id) == 0 &&
+	_settings->get_param(PatchParam::RPN_LSB, _id) == 1) {
+      _settings->set_param(PatchParam::PitchFineTune2, value, _id);
+    }
+
+  } else if (msgId == 64) {                            // Hold1
+    if (_settings->get_param(PatchParam::RxHold1, _id)) {
+      if (value < 64) {
+	_settings->set_param(PatchParam::Hold1, (uint8_t) 0, _id);
+      } else {
+	_settings->set_param(PatchParam::Hold1, (uint8_t) 1, _id);
+      }
+
+      for (auto &n : _notes)
+	n->sustain(_settings->get_param(PatchParam::Hold1, _id));
+
+    } // Note: SC-88 Pro seems to use full 7 bit value for Hold1
+
+  } else if (msgId == 65) {                            // Portamento
+    if (_settings->get_param(PatchParam::RxPortamento, _id)) {
+      if (value < 64)
+	_settings->set_param(PatchParam::Portamento, (uint8_t)0,_id);
+      else
+	_settings->set_param(PatchParam::Portamento, (uint8_t)1,_id);
+    }
+
+  } else if (msgId == 66) {                            // Sostenuto
+    if (_settings->get_param(PatchParam::RxSostenuto, _id)) {
+      if (value < 64)
+	_settings->set_param(PatchParam::Sostenuto, (uint8_t)0,_id);
+      else
+	_settings->set_param(PatchParam::Sostenuto, (uint8_t)1,_id);
+
+      for (auto &n : _notes)
+	n->sustain(_settings->get_param(PatchParam::Sostenuto, _id));
+    }
+
+  } else if (msgId == 67) {                            // Soft
+    if (_settings->get_param(PatchParam::RxSoft, _id)) {
+      if (value < 64)
+	_settings->set_param(PatchParam::Soft, (uint8_t)0,_id);
+      else
+	_settings->set_param(PatchParam::Soft, (uint8_t)1,_id);
+    }
+
+  } else if (msgId == 84) {                            // Portamento control
+    _settings->set_param(PatchParam::PortamentoControl, value, _id);
+    _portaCtrlKey = value & 0x7f;    // glide source for the next note only
+
+  } else if (msgId == 91) {                            // Reverb
+    _settings->set_param(PatchParam::ReverbSendLevel, value, _id);
+    updateGUI = true;
+
+  } else if (msgId == 93) {                            // Chorus
+    _settings->set_param(PatchParam::ChorusSendLevel, value, _id);
+    updateGUI = true;
+
+  } else if (msgId == 98) {                            // NRPN LSB
+    if (_settings->get_param(PatchParam::RxNRPN, _id))
+      _settings->set_param(PatchParam::NRPN_LSB, value, _id);
+
+  } else if (msgId == 99) {                            // NRPN MSB
+    if (_settings->get_param(PatchParam::RxNRPN, _id))
+      _settings->set_param(PatchParam::NRPN_MSB, value, _id);
+
+  } else if (msgId == 100) {                           // RPN LSB
+    if (_settings->get_param(PatchParam::RxRPN, _id))
+      _settings->set_param(PatchParam::RPN_LSB, value, _id);
+
+  } else if (msgId == 101) {                           // RPN MSB
+    if (_settings->get_param(PatchParam::RxRPN, _id))
+      _settings->set_param(PatchParam::RPN_MSB, value, _id);
+
+  // Channel Mode messages
+  } else if (msgId == 120) {                           // All Sounds Off
+    delete_all_notes();
+
+  } else if (msgId == 121) {                           // Reset All Controllers
+    pitch_bend_change(0x00, 0x40, true);
+    _settings->set_param(PatchParam::PolyKeyPressure, 0, (int8_t) _id);
+    _settings->set_param(PatchParam::ChannelPressure, 0, (int8_t) _id);
+    _settings->set_param(PatchParam::Modulation, 0, (int8_t) _id);
+    _settings->set_param(PatchParam::Expression, 127, (int8_t) _id);
+    _settings->set_param(PatchParam::Hold1, 0, (int8_t) _id);
+    _settings->set_param(PatchParam::Portamento, 0, (int8_t) _id);
+    _settings->set_param(PatchParam::Sostenuto, 0, (int8_t) _id);
+    _settings->set_param(PatchParam::Soft, 0, (int8_t) _id);
+    // RPN & NRPN LSB/MSB -> 0x7f?
+
+  } else if (msgId == 123) {                           // All Notes Off
+    stop_all_notes();
+
+  } else if (msgId == 124) {                           // OMNI Off
+    stop_all_notes();
+
+  } else if (msgId == 125) {                           // OMNI On
+    stop_all_notes();
+
+  } else if (msgId == 126) {                           // Mono (-> Mode 4)
+    stop_all_notes();
+    _settings->set_param(PatchParam::PolyMode, (uint8_t) 0, (int8_t) _id);
+
+  } else if (msgId == 127) {                           // Poly (-> Mode 3)
+    stop_all_notes();
+    _settings->set_param(PatchParam::PolyMode, (uint8_t) 1, (int8_t) _id);
+  }
+
+  // Update CC1 and CC2 based on configured controller inputs
+  if (_settings->get_param(PatchParam::CC1ControllerNumber, _id) == msgId)
+    _settings->set_param(PatchParam::CC1Controller, value, _id);
+
+  if (_settings->get_param(PatchParam::CC2ControllerNumber, _id) == msgId)
+    _settings->set_param(PatchParam::CC2Controller, value, _id);
+
+  return updateGUI;
+}
+
+
+/* The SC-55 keeps one poly pressure value per part (address 0x1084), so the
+ * last key pressure received drives the PAf controller routing. */
+int Part::poly_key_pressure(uint8_t key, uint8_t value)
+{
+  (void) key;
+  if (_settings->get_param(PatchParam::RxPolyPressure, _id))
+    _settings->set_param(PatchParam::PolyKeyPressure, value, _id);
+
+  return 0;
+}
+
+
+int Part::channel_pressure(uint8_t value)
+{
+  if (_settings->get_param(PatchParam::RxChPressure, _id))
+    _settings->set_param(PatchParam::ChannelPressure, value, _id);
+
+  return 0;
+}
+
+
+int Part::pitch_bend_change(uint8_t lsb, uint8_t msb, bool force)
+{
+  if (!force && !_settings->get_param(PatchParam::RxPitchBend, _id))
+    return -1;
+  
+  _settings->set_patch_param((uint16_t) PatchParam::PitchBend,
+			     (uint8_t) ((msb & 0x7f) >> 1), _id);
+
+  // SC-55 line has 12 bit resolution on pitch wheel (that is 14 bit)
+  //	  if (_ctrlRom.synthModel == ControlRom::ss_SC55)
+  _settings->set_patch_param((uint16_t) PatchParam::PitchBend + 1,
+			     (uint8_t) ((lsb & 0x7c) | (msb << 7)), _id);
+  //	    else               // SC-88 line has normal 14 bit resolution
+  //	    set_patch_param((uint16_t) PatchParam::PitchBend + 1,
+  //			    (uint8_t) ((lsb & 0x7f) | (msb << 7)), _id);
+
+  // Update PitchBend factor
+  _settings->update_pitchBend_factor(_id);
+
+  return 0;
+}
+
+
+// TODO: Remove all unnecessary variables and initialization
+void Part::reset(void)
+{
+  delete_all_notes();
+
+  _partialReserve = 2;
+
+  _lastPeakSample = 0;
+  _busActive = false;
+  _lastBase[0] = _lastBase[1] = INT_MIN;
+  _portaCtrlKey = -1;
+}
+
+
+// [index, bank] is the [x,y] coordinate in the variation table
+// For drum sets, index is the program number in the drum set bank
+int Part::set_program(uint8_t index, int8_t bank, bool ignRxFlags)
+{
+  if (!ignRxFlags && (!_settings->get_param(PatchParam::RxProgramChange, _id) ||
+		      !_settings->get_param(SystemParam::RxInstrumentChange)))
+    return -1;
+
+  if (bank < 0)
+    bank = _settings->get_param(PatchParam::ToneNumber, _id);
+
+  _settings->set_param(PatchParam::ToneNumber2, index, _id);
+
+  // Finds correct instrument variation from variations table
+  // Implemented according to SC-55 Owner's Manual page 42-45
+  int rhythm = _settings->get_param(PatchParam::UseForRhythm, _id);
+  if (rhythm == mode_Norm) {
+    uint16_t instrument = _ctrlRom.variation(bank)[index];
+    if (bank < 63 && index < 120) {
+      while (instrument == 0xffff)
+	instrument = _ctrlRom.variation(--bank)[index];
+    }
+    if (instrument == 0xffff) // FIXME: Just a workaround
+      bank = 0;
+
+    _settings->set_param(PatchParam::ToneNumber, bank, _id);
+
+  // If part is used for drums, select correct drum set
+  } else {
+    int dsIndex = _settings->update_drum_set(rhythm - 1, index);
+    if (dsIndex < 0) {
+      std::cerr << "libEmuSC: Illegal program for drum set ("
+		<< (int) index << ")" << std::endl;
+      return 0;
+    }
+
+    // Note: ToneNumber (bank) is used as drumSet index for rhythm parts
+    _settings->set_param(PatchParam::ToneNumber, dsIndex, _id);
+  }
+
+  // Send "change" callback for frontend
+  if (_changeCallback) _changeCallback(_id);
+
+  return 1;
+}
+
+
+void Part::set_change_callback(std::function<void(const int)> cb)
+{
+  _changeCallback = cb;
+}
+
+
+void Part::clear_change_callback(void)
+{
+  _changeCallback = NULL;
+}
+
+
+void Part::set_envelope_callback(std::function<void(const float, const float,
+                                                    const float, const float,
+                                                    const float, const float)> cb)
+{
+  _envelopeCallback = cb;
+}
+
+
+void Part::clear_envelope_callback(void)
+{
+  _envelopeCallback = NULL;
+}
+
+
+void Part::set_lfo_callback(std::function<void(const int, const int, const int)
+                            > cb)
+{
+  _lfoCallback = cb;
+}
+
+
+void Part::clear_lfo_callback(void)
+{
+  _lfoCallback = NULL;
+}
+
+}

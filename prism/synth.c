@@ -16,6 +16,7 @@
 #include "plat.h"
 #include "fx.h"
 #include "mt32.h"
+#include "sc55.h"
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
@@ -300,8 +301,25 @@ static void drain_events(void)
             }
             continue;
         }
+        if (kind >= SEV_SC_CH && kind <= SEV_SC_CHO) {   /* SC-55 part events */
+            if (!sc55_is_open()) continue;
+            switch (kind) {
+            case SEV_SC_CH: sc55_part_channel(ch, a); break;
+            case SEV_SC_PROG: sc55_part_program(ch, a); break;
+            case SEV_SC_BANK: sc55_part_bank(ch, a); break;
+            case SEV_SC_LEVEL: sc55_part_cc(ch, 7, a); break;
+            case SEV_SC_PAN: sc55_part_cc(ch, 10, a); break;
+            case SEV_SC_REV: sc55_part_cc(ch, 91, a); break;
+            default: sc55_part_cc(ch, 93, a); break;
+            }
+            continue;
+        }
         if (g_syn_mode == 1 && (kind == SEV_NOTE_ON || kind == SEV_NOTE_OFF)) {   /* audition notes go to the MT-32 */
             if (mt32_is_open() && ch < 9) mt32_part_note(ch, a, kind == SEV_NOTE_ON ? b : 0);
+            continue;
+        }
+        if (g_syn_mode == 2 && (kind == SEV_NOTE_ON || kind == SEV_NOTE_OFF)) {   /* audition notes go to the SC-55 */
+            if (sc55_is_open() && ch < 16) sc55_part_note(ch, a, kind == SEV_NOTE_ON ? b : 0);
             continue;
         }
         if (ch >= SYN_PARTS && kind != SEV_MASTER && kind != SEV_ALLOFF && kind != SEV_POLY) continue;
@@ -344,12 +362,15 @@ static void drain_events(void)
         case SEV_ALLOFF:
             if (s_f) for (int c = 0; c < SYN_PARTS; c++) { tsf_channel_sounds_off_all(s_f, c); g_parts[c].notes = 0; }
             mt32_all_off();
+            sc55_all_off();
             break;
         case SEV_MODE:
-            if (a && !mt32_is_open()) break;         /* nothing to switch to */
+            if (a == 1 && !mt32_is_open()) break;    /* nothing to switch to */
+            if (a == 2 && !sc55_is_open()) break;
             if (g_syn_mode != a) {
                 if (s_f) for (int c = 0; c < SYN_PARTS; c++) { tsf_channel_sounds_off_all(s_f, c); g_parts[c].notes = 0; }
                 mt32_all_off();
+                sc55_all_off();
                 g_syn_mode = a;
             }
             break;
@@ -409,10 +430,16 @@ int syn_audio_thread(unsigned int args, void *argp)
         unsigned char pkt[4];
         int budget = 256;
         if (g_syn_mode == 1 && !mt32_is_open()) g_syn_mode = 0;   /* closed by the panel */
-        while (budget-- > 0 && plat_midi_read(pkt)) { if (g_syn_mode == 1) mt32_midi_packet(pkt); else midi_packet(pkt); }
-        if (g_syn_mode == 1) {
-            mt32_render(buf, OUT_FRAMES);
-            /* the rack's master stage applies to the emulator too: EQ and limiter */
+        if (g_syn_mode == 2 && !sc55_is_open()) g_syn_mode = 0;
+        while (budget-- > 0 && plat_midi_read(pkt)) {
+            if (g_syn_mode == 1) mt32_midi_packet(pkt);
+            else if (g_syn_mode == 2) sc55_midi_packet(pkt);
+            else midi_packet(pkt);
+        }
+        if (g_syn_mode == 1 || g_syn_mode == 2) {
+            if (g_syn_mode == 1) mt32_render(buf, OUT_FRAMES);
+            else sc55_render(buf, OUT_FRAMES);
+            /* the rack's master stage applies to the emulators too: EQ and limiter */
             for (int n = 0; n < OUT_FRAMES * 2; n++) dry[n] = buf[n] * (1.0f / 32768.0f);
             fx_process_master(dry, OUT_FRAMES);
             for (int n = 0; n < OUT_FRAMES * 2; n++) {
@@ -420,7 +447,7 @@ int syn_audio_thread(unsigned int args, void *argp)
                 buf[n] = (short)(v > 32767.0f ? 32767 : v < -32768.0f ? -32768 : (int)v);
             }
             static int snap = 0;
-            if (++snap >= 3) { snap = 0; mt32_snapshot(); }
+            if (++snap >= 3) { snap = 0; if (g_syn_mode == 1) mt32_snapshot(); else sc55_snapshot(); }
         } else if (s_f) {
             {
                 int have = 1 + plat_par_workers();
@@ -450,7 +477,8 @@ int syn_audio_thread(unsigned int args, void *argp)
             float m = g_parts[ch].meter * 0.985f;
             g_parts[ch].meter = m < 0.002f ? 0.0f : m;
         }
-        g_syn_voices = s_f ? tsf_active_voice_count(s_f) : 0;
+        g_syn_voices = g_syn_mode == 2 ? g_sc55.voices
+                     : s_f ? tsf_active_voice_count(s_f) : 0;
         unsigned int work = plat_time_us() - t0;
         if (work > win_max) win_max = work;
         win_sum += work;

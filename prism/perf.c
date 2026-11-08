@@ -1,6 +1,7 @@
 #include "perf.h"
 #include "plat.h"
 #include "mt32.h"
+#include "sc55.h"
 extern int app_load_bank(const char *path);   /* main.c */
 static int s_wanted_mode = -1;
 #include "plat.h"
@@ -123,10 +124,17 @@ int perf_user_load(int slot, Perf *out)
             unsigned char mb[16];
             if (sceIoRead(fd, mb, 16) != 16) ok = 0;
             else {
-                out->mod.valid = mb[0] ? 1 : 0; out->mod.mode = mb[1] ? 1 : 0; out->mod.reverb = mb[2] ? 1 : 0;
+                out->mod.valid = mb[0] ? 1 : 0; out->mod.mode = mb[1] > 2 ? 0 : mb[1]; out->mod.reverb = mb[2] ? 1 : 0;
                 out->mod.gain = mb[3] > 127 ? 127 : mb[3]; out->mod.analog = mb[4] & 3; out->mod.src = mb[5] & 3;
                 out->mod.render = mb[6] ? 1 : 0; out->mod.partials = mb[7] < 8 ? 8 : mb[7] > 32 ? 32 : mb[7];
                 out->mod.cores = mb[8] < 1 ? 1 : mb[8] > 3 ? 3 : mb[8]; out->mod.map = mb[9] ? 1 : 0;
+                /* SC-55 settings in the former spare bytes; zero in old files */
+                out->mod.sc_valid = mb[10] ? 1 : 0;
+                out->mod.sc_map = mb[11] > 2 ? 0 : mb[11];
+                out->mod.sc_poly = mb[12] == 0 ? 0 : mb[12] < 8 ? 8 : mb[12] > 64 ? 64 : mb[12];
+                out->mod.sc_steal = mb[13] ? 1 : 0;
+                out->mod.sc_gain = mb[14] > 127 ? 127 : mb[14];
+                out->mod.sc_cores = mb[15] < 1 ? 1 : mb[15] > 3 ? 3 : mb[15];
             }
         }
         if (v2) {
@@ -179,7 +187,8 @@ int perf_user_save(int slot, const Perf *pf)
     }
     {
         const PerfModule *m = &pf->mod;
-        unsigned char mb[16] = { m->valid, m->mode, m->reverb, m->gain, m->analog, m->src, m->render, m->partials, m->cores, m->map, 0, 0, 0, 0, 0, 0 };
+        unsigned char mb[16] = { m->valid, m->mode, m->reverb, m->gain, m->analog, m->src, m->render, m->partials, m->cores, m->map,
+                                 m->sc_valid, m->sc_map, m->sc_poly, m->sc_steal, m->sc_gain, m->sc_cores };
         sceIoWrite(fd, mb, 16);
     }
     {
@@ -218,9 +227,9 @@ void perf_capture(Perf *out)
     out->master = (uint8_t)g_syn_master;
     out->poly = (uint8_t)g_syn_poly;
     out->fx = g_fx;
-    /* module state: engine in use and MT-32 settings */
+    /* module state: engine in use, MT-32 and SC-55 settings */
     out->mod.valid = 1;
-    out->mod.mode = (uint8_t)(g_syn_mode == 1 ? 1 : 0);
+    out->mod.mode = (uint8_t)(g_syn_mode == 2 ? 2 : g_syn_mode == 1 ? 1 : 0);
     out->mod.reverb = (uint8_t)(g_mt32.reverb_on ? 1 : 0);
     out->mod.gain = (uint8_t)(g_mt32.gain > 127 ? 127 : g_mt32.gain < 0 ? 0 : g_mt32.gain);
     out->mod.analog = (uint8_t)(g_mt32.analog & 3);
@@ -229,6 +238,12 @@ void perf_capture(Perf *out)
     out->mod.partials = (uint8_t)(g_mt32.partials_cap ? g_mt32.partials_cap : 32);
     out->mod.cores = (uint8_t)(g_mt32.cores ? g_mt32.cores : 3);
     out->mod.map = (uint8_t)(g_mt32.map_stock ? 1 : 0);
+    out->mod.sc_valid = 1;
+    out->mod.sc_map = (uint8_t)(g_sc55.soundmap > 2 ? 0 : g_sc55.soundmap);
+    out->mod.sc_poly = (uint8_t)(g_sc55.polycap_set > 64 ? 64 : g_sc55.polycap_set);
+    out->mod.sc_steal = (uint8_t)(g_sc55.steal ? 1 : 0);
+    out->mod.sc_gain = (uint8_t)(g_sc55.gain > 127 ? 127 : g_sc55.gain < 0 ? 0 : g_sc55.gain);
+    out->mod.sc_cores = (uint8_t)(g_sc55.cores ? g_sc55.cores : 3);
     memcpy(out->parts, g_parts, sizeof out->parts);
     for (int i = 0; i < SYN_PARTS; i++) { out->parts[i].meter = 0; out->parts[i].notes = 0; }
 }
@@ -259,7 +274,14 @@ int perf_apply(const Perf *pf)
         mt32_set_cores(pf->mod.cores);
         mt32_set_map(pf->mod.map);
         if (mt32_is_open()) syn_event(SEV_MT_MAP, 0, pf->mod.map, 0);
-        s_wanted_mode = pf->mod.mode ? 1 : 0;
+        s_wanted_mode = pf->mod.mode > 2 ? 0 : pf->mod.mode;
+    }
+    if (pf->mod.valid && pf->mod.sc_valid) {   /* SC-55 settings apply live */
+        sc55_set_map(pf->mod.sc_map);
+        sc55_set_polycap(pf->mod.sc_poly);
+        sc55_set_steal(pf->mod.sc_steal);
+        sc55_set_gain(pf->mod.sc_gain);
+        sc55_set_cores(pf->mod.sc_cores);
     }
     return r;
 }

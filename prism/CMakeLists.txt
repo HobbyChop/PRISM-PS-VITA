@@ -14,15 +14,21 @@ include("$ENV{VITASDK}/share/vita.cmake" REQUIRED)
 
 set(VITA_APP_NAME "PRISM")
 set(VITA_TITLEID  "PRISM0001")
-set(VITA_VERSION  "00.25")
+set(VITA_VERSION  "00.26")
 # ATTRIBUTE2=12: large memory mode for big banks
 set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d PARENTAL_LEVEL=1 -d ATTRIBUTE2=12")
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3 -Wall -Wno-unused-function -fsigned-char -flto")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -Wall -fsigned-char -flto -std=gnu++17")
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -flto -O3")
 
 include_directories(${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/../munt/build/include)
 link_directories(${PROJECT_SOURCE_DIR}/../munt/build)
+
+# libEmuSC (LGPL), the SC-55 engine, with the local changes in emusc/
+file(GLOB EMUSC_SRC ${PROJECT_SOURCE_DIR}/../emusc/libemusc/src/*.cc)
+add_library(emusc STATIC ${EMUSC_SRC})
+target_include_directories(emusc PUBLIC ${PROJECT_SOURCE_DIR}/../emusc/libemusc/src)
 
 # user shim of the MIDI kernel module: weak imports bound when the shim loads
 set(SKPRX_BUILD ${PROJECT_SOURCE_DIR}/module)
@@ -36,6 +42,7 @@ add_executable(${SHORT_NAME}
   cfg.c
   fx.c
   mt32.c
+  sc55.cpp
   ui.c
   gfx.c
   platform_vita.c
@@ -45,6 +52,7 @@ set_target_properties(${SHORT_NAME} PROPERTIES LINKER_LANGUAGE CXX)
 
 target_link_libraries(${SHORT_NAME}
   mt32emu
+  emusc
   VitaUsbMidiUser_stub_weak
   taihen_stub
   SceDisplay_stub
@@ -75,6 +83,8 @@ vita_create_vpk(${SHORT_NAME}.vpk ${VITA_TITLEID} ${SHORT_NAME}.self
   FILE ${PROJECT_SOURCE_DIR}/credits/Munt-AUTHORS.txt credits/Munt-AUTHORS.txt
   FILE ${PROJECT_SOURCE_DIR}/credits/MIT-TinySoundFont.txt credits/MIT-TinySoundFont.txt
   FILE ${PROJECT_SOURCE_DIR}/credits/munt-prism-parallel.patch credits/munt-prism-parallel.patch
+  FILE ${PROJECT_SOURCE_DIR}/credits/LGPL-2.1-EmuSC.txt credits/LGPL-2.1-EmuSC.txt
+  FILE ${PROJECT_SOURCE_DIR}/credits/emusc-prism.patch credits/emusc-prism.patch
   FILE ${PROJECT_SOURCE_DIR}/fonts/sans11.fnt fonts/sans11.fnt
   FILE ${PROJECT_SOURCE_DIR}/fonts/sans12.fnt fonts/sans12.fnt
   FILE ${PROJECT_SOURCE_DIR}/fonts/sans13.fnt fonts/sans13.fnt

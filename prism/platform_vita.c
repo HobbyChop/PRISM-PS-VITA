@@ -33,6 +33,12 @@
 
 char g_app_dir[256];
 
+/* The SC-55 emulator decodes its wave ROMs to floats on the C++ heap
+ * (about 14 MB plus transients), beside Munt and the app; the default
+ * 32 MB newlib heap is too tight for all three. Banks stay outside the
+ * heap in their own blocks, so only the free-memory figure shrinks. */
+unsigned int _newlib_heap_size_user = 64 * 1024 * 1024;
+
 /* imports from VitaUsbMidiUser.suprx (weak, bound when the shim loads) */
 int umidiStart(void);
 int umidiStop(void);
@@ -104,6 +110,7 @@ void plat_init(void)
     sceIoMkdir("ux0:data/prism/soundfonts", 0777);
     sceIoMkdir("ux0:data/prism/performances", 0777);
     sceIoMkdir("ux0:data/prism/mt32", 0777);
+    sceIoMkdir("ux0:data/prism/sc55", 0777);
 }
 
 int plat_cpu_mhz(int *rc) { if (rc) *rc = s_clock_rc; return scePowerGetArmClockFrequency(); }
