@@ -5,3 +5,5 @@ __pycache__/
 roms/
 midi/
 .vscode/
+.claude/settings.local.json
+dist/
